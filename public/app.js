@@ -349,8 +349,9 @@ function renderStatusbar() {
   const files = list.length - dirs;
   const bytes = list.reduce((a, e) => a + (e.isDir ? 0 : e.size || 0), 0);
   sb.classList.remove('hidden');
-  sb.innerHTML = `<span>${list.length} 项${dirs ? ` · ${dirs} 文件夹` : ''}${files ? ` · ${files} 文件 ${fmtSize(bytes)}` : ''}</span><a id="sb-du" title="算上子目录的真实磁盘占用">占用透视</a>`;
+  sb.innerHTML = `<span>${list.length} 项${dirs ? ` · ${dirs} 文件夹` : ''}${files ? ` · ${files} 文件 ${fmtSize(bytes)}` : ''}</span><span class="sb-links"><a id="sb-mem" title="这个文件夹里 AI 干过什么：历史会话、改过的文件、一键续上">项目记忆</a><a id="sb-du" title="算上子目录的真实磁盘占用">占用透视</a></span>`;
   $('#sb-du').onclick = () => diskPanel(state.cwd);
+  $('#sb-mem').onclick = () => memoryPanel(state.cwd);
 }
 function renderFiles() {
   if (state.skillsMode) return; // skills 视图自管 #file-area，文件渲染不要清掉它
@@ -1290,6 +1291,61 @@ function confirmDialog(msg) {
     ov.querySelector('[data-act=yes]').focus();
   });
 }
+// 项目记忆：这个文件夹里 AI 干过什么——历史会话考古，可展开改过的文件，可一键续上
+async function memoryPanel(dirPath) {
+  const old = $('.mem-overlay'); if (old) old.remove();
+  const ov = document.createElement('div');
+  ov.className = 'input-overlay mem-overlay';
+  ov.innerHTML = `<div class="input-dialog mem-dialog">
+    <div class="input-title">项目记忆 · ${escapeHtml(dirPath.replace(state.home, '~'))}</div>
+    <div class="mem-body"><div class="cmdk-loading">翻会话日志中…</div></div></div>`;
+  document.body.appendChild(ov);
+  const onKey = (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); close(); } };
+  const close = () => { ov.remove(); document.removeEventListener('keydown', onKey, true); };
+  ov.onclick = (ev) => { if (ev.target === ov) close(); };
+  document.addEventListener('keydown', onKey, true);
+  const d = await api('/api/project-memory?path=' + encodeURIComponent(dirPath));
+  const body = ov.querySelector('.mem-body');
+  if (!d.ok || !d.sessions.length) {
+    body.innerHTML = '<div class="empty-state">这个文件夹还没有 agent 会话记录<br><br><span class="usage-sub">在这里跑过 Claude Code / Codex 之后，历史会话会出现在这里</span></div>';
+    return;
+  }
+  body.innerHTML = d.sessions.map((s, i) => `
+    <div class="mem-sess">
+      <div class="mem-head" data-i="${i}">
+        <span class="mem-agent${s.agent === 'codex' ? ' codex' : ''}">${s.agent === 'codex' ? '>_' : 'C'}</span>
+        <span class="mem-title">${escapeHtml(s.title || '（无标题会话）')}</span>
+        <button class="ghost-btn mem-resume" data-i="${i}" title="在内嵌终端里接上这段会话的上下文继续">▶ 续上</button>
+      </div>
+      <div class="mem-meta">${fmtTime(s.lastT)} · ${s.userMsgs} 条消息${s.files.length ? ` · 改了 ${s.files.length} 个文件` : ''}${s.skills.length ? ' · ' + s.skills.map((k) => `<i class="mem-skill">${escapeHtml(k)}</i>`).join(' ') : ''}</div>
+      ${s.files.length ? `<div class="mem-files hidden">${s.files.map((f) => `<div class="mem-file" data-p="${escapeHtml(f)}" title="${escapeHtml(f)}">${escapeHtml(f.startsWith(dirPath + '/') ? f.slice(dirPath.length + 1) : f.replace(state.home, '~'))}</div>`).join('')}</div>` : ''}
+    </div>`).join('');
+  body.querySelectorAll('.mem-head').forEach((h) => {
+    h.onclick = (ev) => {
+      if (ev.target.closest('.mem-resume')) return;
+      const files = h.parentElement.querySelector('.mem-files');
+      if (files) files.classList.toggle('hidden');
+    };
+  });
+  body.querySelectorAll('.mem-resume').forEach((b) => {
+    b.onclick = () => {
+      const s = d.sessions[Number(b.dataset.i)];
+      const cmd = s.agent === 'codex' ? `codex resume ${s.id}` : `claude --dangerously-skip-permissions --resume ${s.id}`;
+      close();
+      term.resumeAgent(dirPath, cmd);
+    };
+  });
+  body.querySelectorAll('.mem-file').forEach((f) => {
+    f.onclick = async () => {
+      const p = f.dataset.p;
+      close();
+      await navigate(dirOf(p));
+      const e = state.entries.find((x) => x.path === p);
+      if (e) { state.selected = p; openPreview(e); renderFiles(); }
+    };
+  });
+}
+
 // 磁盘占用透视：du 口径的真实占用条形榜，目录行可下钻
 async function diskPanel(dirPath) {
   const old = $('.disk-overlay'); if (old) old.remove();
@@ -1965,6 +2021,13 @@ const term = {
     }
     if (!sess) sess = await this.openInDir(state.cwd); // 等 spawn 完，拿确切 session 写入
     if (sess && !sess.dead) { this.input(sess.id, cmd + '\r'); sess.xterm.focus(); toast('已在终端启动 ' + cmd); }
+    else toast('终端启动失败', true);
+  },
+  // 续上历史会话：必须在项目目录新开标签（claude --resume 按当前目录找会话），不复用别处的空闲 shell
+  async resumeAgent(dir, cmd) {
+    if (!this.available()) { openWith(dir, 'terminal'); return; }
+    const sess = await this.openInDir(dir);
+    if (sess && !sess.dead) { this.input(sess.id, cmd + '\r'); sess.xterm.focus(); toast('已在终端续上会话'); }
     else toast('终端启动失败', true);
   },
   // 该会话前台是不是裸 shell？判断不了一律按「不是」处理——宁可新开标签，也不往运行中的程序里打字

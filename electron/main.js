@@ -313,6 +313,34 @@ ipcMain.handle('drop:save', (e, { name, buf }) => {
     return { ok: true, path: dest };
   } catch (err) { return { ok: false, error: err.message }; }
 });
+// 同名不覆盖：foo.png 已存在就退而求其次 foo 2.png（仿访达）
+function uniqueDest(dest) {
+  if (!fs.existsSync(dest)) return dest;
+  const d = path.dirname(dest), ext = path.extname(dest), base = path.basename(dest, ext);
+  for (let i = 2; i < 1000; i++) { const c = path.join(d, `${base} ${i}${ext}`); if (!fs.existsSync(c)) return c; }
+  return path.join(d, `${Date.now()}-${base}${ext}`);
+}
+// 拖进文件区：把没路径的拖入内容（截图浮窗等）写进目标目录
+ipcMain.handle('drop:save-into', (e, { dir, name, buf }) => {
+  try {
+    if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { ok: false, error: '目标目录无效' };
+    const safe = String(name || '拖入文件').replace(/[/\\:]/g, '_');
+    const dest = uniqueDest(path.join(dir, safe));
+    fs.writeFileSync(dest, Buffer.from(buf));
+    return { ok: true, path: dest };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+// 拖进文件区：把已有路径的文件（Finder 文件）复制进目标目录
+ipcMain.handle('drop:copy-into', (e, { srcPath, dir }) => {
+  try {
+    if (!srcPath || !fs.existsSync(srcPath)) return { ok: false, error: '源文件不存在' };
+    if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { ok: false, error: '目标目录无效' };
+    const dest = uniqueDest(path.join(dir, path.basename(srcPath)));
+    if (path.resolve(srcPath) === path.resolve(dest)) return { ok: true, path: dest }; // 原地拖入，无需复制
+    fs.copyFileSync(srcPath, dest);
+    return { ok: true, path: dest };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
 
 ipcMain.on('pty:input', (e, { id, data }) => { const p = terminals.get(id); if (p) p.write(data); });
 ipcMain.on('pty:resize', (e, { id, cols, rows }) => { const p = terminals.get(id); if (p) { try { p.resize(cols, rows); } catch { /* */ } } });

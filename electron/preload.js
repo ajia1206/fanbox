@@ -32,6 +32,10 @@ contextBridge.exposeInMainWorld('fanboxDrop', {
   pathForFile: (file) => { try { return webUtils.getPathForFile(file) || ''; } catch { return ''; } },
   // file-promise 类拖拽（如 macOS 截图浮窗缩略图）没有现成路径：把内容落盘到临时目录换一个路径
   saveTemp: (name, buf) => ipcRenderer.invoke('drop:save', { name, buf }),
+  // 拖进文件区：没路径的拖入内容（截图浮窗等）直接存进目标目录
+  saveInto: (dir, name, buf) => ipcRenderer.invoke('drop:save-into', { dir, name, buf }),
+  // 拖进文件区：已有路径的文件（Finder 文件）复制进目标目录
+  copyInto: (srcPath, dir) => ipcRenderer.invoke('drop:copy-into', { srcPath, dir }),
 });
 
 contextBridge.exposeInMainWorld('fanboxShot', {

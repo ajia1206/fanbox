@@ -479,6 +479,25 @@ function bindItem(el, e) {
   el.ondblclick = (ev) => { if (ev.target.closest('.fav-btn')) return; onItemOpen(e); };
   el.oncontextmenu = (ev) => { state.cursor = Number(el.dataset.idx); showContextMenu(ev, e); };
 }
+// 把系统拖入的文件（Finder 文件 / 截图浮窗缩略图）存进目标目录：
+// 有真实路径就复制进去，没路径（file-promise）就把字节直接写进去。仿终端那套口径。
+async function dropFilesInto(fileList, dir) {
+  if (!window.fanboxDrop || !dir) { toast('该环境不支持拖入保存', true); return; }
+  const files = [...(fileList || [])];
+  if (!files.length) return;
+  let saved = 0, lastPath = null;
+  for (const f of files) {
+    const src = window.fanboxDrop.pathForFile(f);
+    let r;
+    if (src) r = await window.fanboxDrop.copyInto(src, dir).catch(() => null);
+    else r = await window.fanboxDrop.saveInto(dir, f.name, await f.arrayBuffer()).catch(() => null);
+    if (r && r.ok) { saved++; lastPath = r.path; }
+  }
+  if (!saved) { toast('存入失败', true); return; }
+  const where = dir === state.cwd ? '' : '「' + baseOf(dir) + '」';
+  toast(saved === 1 ? `已存入${where} ${baseOf(lastPath)}` : `已存入${where} ${saved} 个文件`);
+  if (dir === state.cwd && !state.recentMode) { await refresh(); if (lastPath) applySelection(lastPath); }
+}
 // 让任意元素可拖拽出一个路径（侧栏目录/收藏 → 终端）
 function makeDraggablePath(el, p) {
   el.draggable = true;
@@ -2044,6 +2063,28 @@ function bindEvents() {
   };
   $('#file-area').addEventListener('dblclick', blankMenu);
   $('#file-area').addEventListener('contextmenu', blankMenu);
+  // 拖入文件区 = 存进当前目录；拖到某文件夹图标上 = 存进那个文件夹（截图浮窗、Finder 文件都行）。
+  // 只接「外部文件」拖入（dataTransfer 里有 Files）；fanbox 内部拖拽不带 Files，不受影响。
+  const fileArea = $('#file-area');
+  const clearDropHi = () => { fileArea.classList.remove('area-drop'); fileArea.querySelectorAll('.item.drop-into').forEach((x) => x.classList.remove('drop-into')); };
+  fileArea.addEventListener('dragover', (ev) => {
+    if (state.skillsMode || !ev.dataTransfer.types.includes('Files')) return;
+    ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy';
+    const item = ev.target.closest('.item');
+    const idx = item ? Number(item.dataset.idx) : -1;
+    const overDir = idx >= 0 && state.visible[idx] && state.visible[idx].isDir ? item : null;
+    if (overDir) { if (!overDir.classList.contains('drop-into')) { clearDropHi(); overDir.classList.add('drop-into'); } }
+    else { fileArea.querySelectorAll('.item.drop-into').forEach((x) => x.classList.remove('drop-into')); fileArea.classList.add('area-drop'); }
+  });
+  fileArea.addEventListener('dragleave', (ev) => { if (!fileArea.contains(ev.relatedTarget)) clearDropHi(); });
+  fileArea.addEventListener('drop', async (ev) => {
+    if (state.skillsMode || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+    ev.preventDefault(); clearDropHi();
+    const item = ev.target.closest('.item');
+    const idx = item ? Number(item.dataset.idx) : -1;
+    const over = idx >= 0 ? state.visible[idx] : null;
+    await dropFilesInto(ev.dataTransfer.files, over && over.isDir ? over.path : state.cwd);
+  });
   $('#content').addEventListener('contextmenu', (e) => { if (!e.target.closest('#file-area')) blankMenu(e); });
   document.addEventListener('click', (e) => { if (!e.target.closest('#context-menu')) closeContextMenu(); });
   window.addEventListener('blur', closeContextMenu);

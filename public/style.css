@@ -809,6 +809,16 @@ kbd {
   animation: dropIn 0.16s cubic-bezier(0.2, 0.7, 0.3, 1);
 }
 @keyframes dropIn { from { opacity: 0; transform: scale(0.985); } to { opacity: 1; transform: scale(1); } }
+/* 拖入文件区落盘：整片区域高亮（存进当前目录）/ 某文件夹高亮（存进那个文件夹） */
+#file-area.area-drop { position: relative; }
+#file-area.area-drop::after {
+  content: '松开 · 存入当前目录'; position: absolute; inset: 4px; z-index: 20;
+  display: flex; align-items: center; justify-content: center; pointer-events: none;
+  border: 2px dashed var(--accent); border-radius: var(--radius);
+  background: var(--accent-soft); color: var(--accent); font-size: 13px; font-weight: 600;
+  animation: dropIn 0.16s cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+.item.drop-into { box-shadow: inset 0 0 0 2px var(--accent); background: var(--accent-soft); border-radius: var(--radius); }
 .dock-bottom #terminal-panel { width: 100%; border-top: 1px solid var(--border); }
 .dock-right #terminal-panel { height: 100%; border-left: 1px solid var(--border); }
 

@@ -3232,6 +3232,22 @@ const follow = {
   timers: {},
 };
 const isHtmlName = (n) => /\.(html?|xhtml)$/i.test(String(n || ''));
+// 「产物」= agent 编译/打包出来的东西，不是写给人实时看的源码：二进制、库、压缩包、安装包。
+// 跟随到这些时不抢实时渲染，改成一张干净的产物卡片（而不是死板的「无法预览」）。
+const ARTIFACT_EXT = new Set(['app', 'dylib', 'so', 'o', 'a', 'node', 'wasm', 'bin', 'exe', 'dll', 'class', 'pyc', 'pyo',
+  'dmg', 'pkg', 'deb', 'rpm', 'msi', 'framework', 'jar', 'war', 'ipa', 'apk', 'lib', 'obj', 'zip', 'tar', 'gz', 'tgz',
+  'bz2', 'xz', '7z', 'rar', 'iso', 'bundle', 'xcarchive']);
+// 无扩展名但其实是文本、值得跟的常见配置/构建文件（白名单外的无扩展名一律按二进制产物处理）
+const NOEXT_TEXT = new Set(['Makefile', 'Dockerfile', 'LICENSE', 'README', 'CHANGELOG', 'Procfile', 'Gemfile',
+  'Rakefile', 'Brewfile', 'Caddyfile', 'Justfile', 'Vagrantfile', 'Jenkinsfile']);
+function isFollowArtifact(name) {
+  const base = baseOf(String(name || ''));
+  const segs = String(name).split('/');
+  if (segs.some((s) => /\.(app|framework|xcarchive|bundle)$/i.test(s))) return true; // .app 等「包」内部的一切都算产物
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return !NOEXT_TEXT.has(base); // 无扩展名：白名单外当二进制（编译出的可执行多半没扩展名）
+  return ARTIFACT_EXT.has(base.slice(dot + 1).toLowerCase());
+}
 function setFileFollow(on, offMsg) {
   if (follow.on === on) return;
   follow.on = on;
@@ -3264,8 +3280,8 @@ function inFollowScope(full) {
   if (!root) return false;
   return full === root || full.startsWith(root + '/');
 }
-// 看头优先级：html/md 这种「写给人看的」> 代码 > 其它（图片/数据等）
-const followPrio = (p) => (isHtmlName(p) || isMdName(p)) ? 2 : (kindFromName(p) === 'text' ? 1 : 0);
+// 看头优先级：html/md 这种「写给人看的」> 代码 > 其它（图片/数据）> 产物（二进制/压缩包，最不该抢屏）
+const followPrio = (p) => isFollowArtifact(p) ? 0 : ((isHtmlName(p) || isMdName(p)) ? 3 : (kindFromName(p) === 'text' ? 2 : 1));
 // 变更事件入口（已过噪声/自打开过滤）：同一文件继续写 → 只刷视图；换了文件 → 节流切目标
 function followChange(dir, sub) {
   if (!follow.on) return;
@@ -3322,6 +3338,10 @@ function scheduleFollowRender() {
 async function followRender(e, first) {
   if (!follow.on || follow.path !== e.path) return;
   const kind = e.kind || kindFromName(e.path);
+  // 产物（二进制/压缩包/包内容）或服务端识别为不可预览的：不实时渲染，给一张干净的产物卡片
+  if (isFollowArtifact(e.name) || !['text', 'image', 'video', 'audio', 'pdf'].includes(kind)) {
+    return followArtifactCard(e);
+  }
   if (kind === 'text') {
     if (first) followChrome(e);
     if (isHtmlName(e.name)) return liveHtml(e, first);
@@ -3341,8 +3361,25 @@ function followChrome(e) {
   renderPreviewFoot(e);
   $('#preview-body').innerHTML = '<div class="cmdk-loading">加载中…</div>';
 }
+// 产物卡片：agent 编译/打包出来的成品，没法实时渲染，给一张「已生成」的交付态卡片，比「无法预览」有用得多
+function followArtifactCard(e) {
+  followChrome(e);
+  const body = $('#preview-body');
+  const real = state.entries.find((x) => x.path === e.path) || e;
+  const sizeStr = real.size ? fmtSize(real.size) : '';
+  body.innerHTML =
+    `<div class="empty-state artifact-card">
+      <div class="big">${iconSvg(real, 48)}</div>
+      <div class="art-name">${escapeHtml(e.name)}</div>
+      <div class="art-sub">agent 刚生成${sizeStr ? ' · ' + sizeStr : ''}</div>
+      <div class="art-btns"><button class="ghost-btn" data-act="reveal">在访达显示</button><button class="ghost-btn" data-act="open">打开</button></div>
+    </div>`;
+  body.querySelector('[data-act="reveal"]').onclick = () => openWith(e.path, 'reveal');
+  body.querySelector('[data-act="open"]').onclick = () => openWith(e.path, 'default');
+}
 function followBadge(e) {
-  $('#preview-title').innerHTML = `<span class="live-badge"><i></i>跟随中</span>${escapeHtml(e.name)}`;
+  const art = isFollowArtifact(e.name);
+  $('#preview-title').innerHTML = `<span class="live-badge${art ? ' done' : ''}"><i></i>${art ? '已生成' : '跟随中'}</span>${escapeHtml(e.name)}`;
 }
 // 找出新内容相对旧内容的变动行区间（首尾共同前后缀夹逼，够准且 O(n)）
 function changedRange(oldStr, newStr) {

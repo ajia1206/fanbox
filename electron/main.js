@@ -85,7 +85,14 @@ app.whenReady().then(() => {
   lidIntent = !!readConfig().lidStayAwake;
   if (process.platform === 'darwin') trySetDisableSleep(false);
   buildMenu();
+  try {
+    const m = Menu.getApplicationMenu();
+    const view = m && m.items.find((i) => i.label === M('视图', 'View'));
+    console.log('[lid] 视图 子菜单 =', view ? JSON.stringify(view.submenu.items.map((x) => x.label || `<${x.type}>`)) : '没找到视图菜单');
+  } catch (e) { console.log('[lid] dump menu 出错:', e.message); }
   createWindow();
+  // 临时调试：dev 实例强制抢到最前，避免和正式版搞混
+  setTimeout(() => { try { app.focus({ steal: true }); if (win && !win.isDestroyed()) { win.show(); win.focus(); win.setAlwaysOnTop(true); setTimeout(() => win.setAlwaysOnTop(false), 1500); } } catch { /* */ } }, 1200);
   startShotWatch();
   // 启动 6 秒后查一次新版本（不挡启动）；长开会话每 2 小时再查；
   // 窗口重新聚焦也顺手查（30 分钟节流）——否则发版当天老 app 要等满周期才知道有新版
@@ -116,16 +123,23 @@ function startShotWatch() {
       // 截屏写盘有「.截屏xxx.png」点前缀的中间态，跳过；只认系统截屏的命名习惯
       if (!/^(截屏|截圖|截图|Screenshot|Screen Shot|CleanShot|SCR-)/i.test(name) || !/\.(png|jpe?g)$/i.test(name)) return;
       const fp = path.join(dir, name);
-      setTimeout(() => { // 等写盘完成再确认
+      // 等写盘「真正完成」再通知：Retina 全屏截图有几 MB，固定等 600ms 可能文件还在写，
+      // 缩略图会拿到半截文件生成失败→裂图。改成轮询直到大小连续两次不变（最多 ~3s）。
+      const waitStable = (tries, lastSize) => {
         fs.stat(fp, (err, st) => {
-          if (err || !st.isFile() || st.size < 1000) return;
-          const last = shotSent.get(fp) || 0;
-          if (Date.now() - last < 3000) return;
-          shotSent.set(fp, Date.now());
-          if (shotSent.size > 50) { const k = shotSent.keys().next().value; shotSent.delete(k); }
-          if (win && !win.isDestroyed()) win.webContents.send('shot:new', { path: fp, name, size: st.size });
+          if (err || !st.isFile()) return;
+          if (st.size >= 1000 && st.size === lastSize) { // 大小稳定 = 写完
+            const last = shotSent.get(fp) || 0;
+            if (Date.now() - last < 3000) return;
+            shotSent.set(fp, Date.now());
+            if (shotSent.size > 50) { const k = shotSent.keys().next().value; shotSent.delete(k); }
+            if (win && !win.isDestroyed()) win.webContents.send('shot:new', { path: fp, name, size: st.size });
+            return;
+          }
+          if (tries > 0) setTimeout(() => waitStable(tries - 1, st.size), 250); // 还在涨，再等
         });
-      }, 600);
+      };
+      setTimeout(() => waitStable(12, -1), 350);
     });
   } catch { /* 无权限等，静默放弃 */ }
 }
@@ -241,7 +255,8 @@ let lidActive = false; // 当前是否已对系统下达禁休眠
 // 用 sudo -n（非交互）切换；sudoers 没装好就直接失败、绝不在后台弹密码
 function trySetDisableSleep(on) {
   if (process.platform !== 'darwin') return false;
-  try { require('child_process').execFileSync('/usr/bin/sudo', ['-n', 'pmset', '-a', 'disablesleep', on ? '1' : '0']); return true; }
+  // stdio 全静音：免密规则没装时 `sudo -n` 会往 stderr 喷「a password is required」，无害但会误导
+  try { require('child_process').execFileSync('/usr/bin/sudo', ['-n', 'pmset', '-a', 'disablesleep', on ? '1' : '0'], { stdio: 'ignore' }); return true; }
   catch { return false; }
 }
 
@@ -265,7 +280,9 @@ function installSudoers() {
     try { tmp = path.join(app.getPath('temp'), 'fanbox-sudoers-install.sh'); fs.writeFileSync(tmp, sh, { mode: 0o700 }); }
     catch { return resolve(false); }
     const apple = `do shell script "/bin/sh " & quoted form of "${tmp}" with administrator privileges`;
-    require('child_process').execFile('/usr/bin/osascript', ['-e', apple], (err) => {
+    console.log('[lid] running osascript admin prompt, tmp =', tmp);
+    require('child_process').execFile('/usr/bin/osascript', ['-e', apple], (err, stdout, stderr) => {
+      console.log('[lid] osascript done. err =', err && err.message, '| stderr =', stderr);
       try { fs.unlinkSync(tmp); } catch { /* */ }
       resolve(!err); // 用户取消 → err（-128）→ false
     });
@@ -285,6 +302,7 @@ function refreshLidGuard() {
 
 // 菜单勾选/取消的入口
 async function setLidIntent(on) {
+  console.log('[lid] setLidIntent called, on =', on);
   if (process.platform !== 'darwin') return;
   if (on) {
     const choice = dialog.showMessageBoxSync(win && !win.isDestroyed() ? win : undefined, {
@@ -293,10 +311,14 @@ async function setLidIntent(on) {
       detail: M('开启后，只要还有终端会话在跑，合上盖子也不会休眠——agent 任务能接着干。\n\n注意：合盖期间持续耗电发热，建议接电源。终端全部退出或退出翻箱时自动恢复正常休眠。\n\n首次开启需输入一次管理员密码（装一条仅限电源设置的免密规则）。',
         'While any terminal session is running, closing the lid won\'t sleep the Mac — your agent tasks keep going.\n\nNote: it keeps drawing power and heat while closed; stay plugged in. Normal sleep is restored once all terminals exit or you quit FanBox.\n\nFirst time needs your admin password once (installs a power-only passwordless rule).'),
     });
+    console.log('[lid] warning dialog choice =', choice, '(0=开启)');
     if (choice !== 0) { buildMenu(); return; } // 取消 → 复位勾选
     // 探针：能否免密 sudo（设 0 无害）。不行就装规则。
-    if (!trySetDisableSleep(false)) {
+    const probe = trySetDisableSleep(false);
+    console.log('[lid] sudo probe ok =', probe, '→', probe ? '已有免密规则' : '需安装');
+    if (!probe) {
       const installed = await installSudoers();
+      console.log('[lid] installSudoers result =', installed);
       if (!installed) { buildMenu(); return; } // 装失败/取消 → 保持关闭
     }
   }
@@ -540,6 +562,7 @@ ipcMain.handle('rec:list', () => {
           width: meta.width || 80, height: meta.height || 24,
           cwd: (meta.fanbox && meta.fanbox.cwd) || '',
           startedAt: (meta.fanbox && meta.fanbox.startedAt) || (meta.timestamp ? meta.timestamp * 1000 : st.birthtimeMs),
+          duration: readLastEventTime(full, st.size), // 原始时长（末事件时间），列表里给用户选片参考
           recording: live.has(full), // 还在录的会话
         });
       } catch { /* 损坏的文件跳过 */ }
@@ -576,6 +599,46 @@ ipcMain.handle('rec:save-export', (e, { name, buf }) => {
     return { ok: true, path: dest };
   } catch (err) { return { ok: false, error: err.message }; }
 });
+// 导出：渲染层录出的永远是 WebM；要 MP4/GIF 就用本机 ffmpeg 转一道（检测不到 ffmpeg 优雅退回 WebM）。
+function findFfmpeg() {
+  for (const c of ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']) { try { if (fs.existsSync(c)) return c; } catch { /* */ } }
+  return null;
+}
+ipcMain.handle('rec:export', async (e, { name, buf, format }) => {
+  const { execFile } = require('child_process');
+  const crypto = require('crypto');
+  try {
+    const dir = path.join(REC_DIR(), 'exports');
+    fs.mkdirSync(dir, { recursive: true });
+    const base = String(name || 'export').replace(/[/\\:]/g, '_').replace(/\.[a-z0-9]+$/i, '').slice(0, 120);
+    const tmp = path.join(dir, '.tmp-' + process.pid + '-' + crypto.randomBytes(3).toString('hex') + '.webm');
+    fs.writeFileSync(tmp, Buffer.from(buf));
+    const saveWebm = (reason) => { const d = uniqueDest(path.join(dir, base + '.webm')); fs.renameSync(tmp, d); return { ok: true, path: d, format: 'webm', fellBack: reason || null }; };
+    if (format === 'webm') return saveWebm();
+    const ff = findFfmpeg();
+    if (!ff) return saveWebm('未检测到 ffmpeg，已存 WebM');
+    const run = (args) => new Promise((res, rej) => execFile(ff, args, { timeout: 180000 }, (err, so, se) => (err ? rej(new Error((se || err.message || '').slice(0, 300))) : res())));
+    try {
+      if (format === 'mp4') {
+        const dest = uniqueDest(path.join(dir, base + '.mp4'));
+        // 偶数宽高（yuv420p 要求）+ faststart（边下边播）
+        await run(['-y', '-i', tmp, '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', dest]);
+        fs.rmSync(tmp, { force: true });
+        return { ok: true, path: dest, format: 'mp4' };
+      }
+      if (format === 'gif') {
+        const dest = uniqueDest(path.join(dir, base + '.gif'));
+        const pal = tmp + '.png';
+        // 两遍调色板，GIF 才不糊不抖；宽度封到 900，15fps，体积友好
+        await run(['-y', '-i', tmp, '-vf', 'fps=15,scale=900:-1:flags=lanczos,palettegen=stats_mode=diff', pal]);
+        await run(['-y', '-i', tmp, '-i', pal, '-lavfi', 'fps=15,scale=900:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3', dest]);
+        fs.rmSync(tmp, { force: true }); fs.rmSync(pal, { force: true });
+        return { ok: true, path: dest, format: 'gif' };
+      }
+    } catch (convErr) { try { return saveWebm('转码失败（' + convErr.message + '），已存 WebM'); } catch { /* */ } }
+    return saveWebm();
+  } catch (err) { return { ok: false, error: err.message }; }
+});
 function isInRecDir(p) {
   try { const r = path.resolve(REC_DIR()); return p && path.resolve(p).startsWith(r + path.sep); }
   catch { return false; }
@@ -590,6 +653,22 @@ function readFirstLine(file) {
     const nl = s.indexOf('\n');
     return nl >= 0 ? s.slice(0, nl) : s;
   } finally { fs.closeSync(fd); }
+}
+// 读文件尾，取最后一条事件的时间戳 = 原始时长（不把大文件整读进内存）
+function readLastEventTime(file, size) {
+  try {
+    const len = Math.min(4096, size);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, Math.max(0, size - len));
+      const lines = buf.toString('utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try { const v = JSON.parse(lines[i]); if (Array.isArray(v) && typeof v[0] === 'number') return v[0]; } catch { /* 末行可能被截断，往前找 */ }
+      }
+    } finally { fs.closeSync(fd); }
+  } catch { /* */ }
+  return 0;
 }
 
 // lsof 在非 UTF-8 locale 下会把中文路径按字节转义成 \xe8 字面量（GUI 启动的 app 不继承 shell 的 locale，
@@ -623,6 +702,130 @@ ipcMain.handle('pty:cwd', (e, { id }) => new Promise((resolve) => {
 ipcMain.handle('pty:proc', (e, { id }) => {
   const p = terminals.get(id);
   return p ? { ok: true, proc: p.process || '' } : { ok: false };
+});
+
+// ---------- 微信 ClawBot：微信 →（官方插件）→ OpenClaw →（runtime）→ Claude Code / Codex ----------
+// GUI 启动的 app 只继承精简 PATH，openclaw 在 ~/.npm-global/bin 等处会找不到 → 一律走 login shell（zsh -lc）带全 PATH。
+const wxLoginShell = () => process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
+function ocEnv() {
+  const env = { ...process.env };
+  if (!/UTF-8/i.test(env.LC_ALL || env.LC_CTYPE || env.LANG || '')) env.LANG = 'en_US.UTF-8';
+  return env;
+}
+// 跑一条 openclaw 命令，拿 stdout（login shell 带全 PATH）
+function ocRun(cmd, timeout = 20000) {
+  return new Promise((resolve) => {
+    const { execFile } = require('child_process');
+    execFile(wxLoginShell(), ['-lc', cmd], { env: ocEnv(), timeout, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
+const wxAccountsFile = () => path.join(os.homedir(), '.openclaw', 'openclaw-weixin', 'accounts.json');
+const ocSessionsDir = () => path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions');
+function wxAccount() {
+  try { const a = JSON.parse(fs.readFileSync(wxAccountsFile(), 'utf8')); if (Array.isArray(a) && a.length) return a[0]; } catch { /* 没绑过 */ }
+  return '';
+}
+let wxLogin = null; // 等待扫码的登录子进程
+
+// 环境/连接状态：装没装 openclaw、有没有绑过微信、main agent 现在是哪个模型（= 微信连的是谁）
+ipcMain.handle('wechat:env', async () => {
+  const which = await ocRun('command -v openclaw || true', 8000);
+  const installed = !!which.stdout.trim();
+  let agentModel = '';
+  if (installed) agentModel = (await ocRun('openclaw config get agents.defaults.model.primary 2>/dev/null || true', 8000)).stdout.trim();
+  const account = wxAccount();
+  return { ok: true, installed, connected: !!account, account, agentModel };
+});
+
+// 启用插件 → 起网关 → 流式跑 login：二维码 URL、连接成功都通过事件推给前端
+ipcMain.handle('wechat:login', async () => {
+  const which = await ocRun('command -v openclaw || true', 8000);
+  if (!which.stdout.trim()) return { ok: false, error: 'openclaw 未安装' };
+  if (wxLogin) { try { wxLogin.kill(); } catch { /* */ } wxLogin = null; }
+  await ocRun('openclaw config set plugins.entries.openclaw-weixin.enabled true', 20000); // 幂等
+  await ocRun('openclaw gateway start', 30000); // 幂等，已在跑也无妨
+  const { spawn } = require('child_process');
+  const p = spawn(wxLoginShell(), ['-lc', 'openclaw channels login --channel openclaw-weixin'], { env: ocEnv() });
+  wxLogin = p;
+  let buf = '', qrSent = false, done = false;
+  const send = (ch, m) => { if (win && !win.isDestroyed()) win.webContents.send(ch, m); };
+  const QRCode = require('qrcode');
+  const onChunk = async (d) => {
+    buf += d.toString('utf8');
+    if (!qrSent) {
+      const m = buf.match(/https:\/\/liteapp\.weixin\.qq\.com\/\S+/);
+      if (m) {
+        qrSent = true;
+        let dataUrl = '';
+        try { dataUrl = await QRCode.toDataURL(m[0], { width: 240, margin: 1 }); } catch { /* 退回给前端原始 URL */ }
+        send('wechat:qr', { url: m[0], dataUrl });
+      }
+    }
+    if (!done && /已将此\s*OpenClaw\s*连接到微信|connected this OpenClaw to (WeChat|Weixin)/i.test(buf)) {
+      done = true;
+      // 登录存了凭证但运行中的网关不会热加载新 channel，必须重启才激活；restart 用 launchctl 会 I/O error，改 stop→start
+      await ocRun('openclaw gateway stop', 30000);
+      await ocRun('openclaw gateway start', 30000);
+      send('wechat:connected', { ok: true, account: wxAccount() });
+    }
+  };
+  p.stdout.on('data', onChunk);
+  p.stderr.on('data', onChunk);
+  p.on('exit', () => { if (wxLogin === p) wxLogin = null; });
+  return { ok: true };
+});
+
+// 关弹窗时若还在等扫码，停掉登录进程（避免悬挂）
+ipcMain.handle('wechat:cancel', () => {
+  if (wxLogin) { try { wxLogin.kill(); } catch { /* */ } wxLogin = null; }
+  return { ok: true };
+});
+
+// 断开：登出微信 channel
+ipcMain.handle('wechat:disconnect', async () => {
+  if (wxLogin) { try { wxLogin.kill(); } catch { /* */ } wxLogin = null; }
+  const acc = wxAccount();
+  const r = await ocRun(`openclaw channels logout --channel openclaw-weixin${acc ? ` --account ${acc}` : ''}`, 30000);
+  return { ok: r.ok, error: r.stderr };
+});
+
+// 列出微信来的会话（sessions list 里筛 openclaw-weixin + @im.wechat，取 session id）
+ipcMain.handle('wechat:sessions', async () => {
+  const r = await ocRun('openclaw sessions list', 20000);
+  const items = [];
+  for (const line of (r.stdout || '').split('\n')) {
+    if (!/openclaw-weixin/.test(line) || !/@im\.wechat/.test(line)) continue;
+    const id = (line.match(/id:([0-9a-fA-F-]{36})/) || [])[1];
+    const age = (line.match(/(\d+\s*\w+ ago)/) || [])[1] || '';
+    if (id) items.push({ id, age });
+  }
+  return { ok: true, items };
+});
+
+// 读对话正文：解析 transcript JSONL，取 user / assistant 的可读文本（跳过 toolCall / toolResult 噪声）
+ipcMain.handle('wechat:transcript', (e, { sid }) => {
+  if (!/^[0-9a-fA-F-]{36}$/.test(sid || '')) return { ok: false, error: 'bad sid' };
+  let txt;
+  try { txt = fs.readFileSync(path.join(ocSessionsDir(), sid + '.jsonl'), 'utf8'); }
+  catch { return { ok: false, error: 'no transcript' }; }
+  const msgs = [];
+  for (const line of txt.split('\n')) {
+    if (!line.trim()) continue;
+    let o; try { o = JSON.parse(line); } catch { continue; }
+    if (o.type !== 'message' || !o.message) continue;
+    const role = o.message.role;
+    if (role !== 'user' && role !== 'assistant') continue;
+    const c = o.message.content;
+    let text = '';
+    if (typeof c === 'string') text = c;
+    else if (Array.isArray(c)) text = c.filter((b) => b && b.type === 'text' && b.text).map((b) => b.text).join('\n').trim();
+    if (!text) continue; // 纯工具调用的 assistant 轮不显示
+    if (role === 'user' && /^Delivery:\s/.test(text)) continue; // 投递框架注入的系统指令，不是用户说的话
+    msgs.push({ role, text, time: o.timestamp || '' });
+  }
+  return { ok: true, msgs };
 });
 
 // ---------- 文件监听（agent 改文件 → 自动刷新 + 跨项目变更收件箱）----------

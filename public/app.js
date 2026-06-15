@@ -209,6 +209,15 @@ function fmtSize(n) {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
 }
+// 秒 → 人话时长（录像列表用）：93→「1分33秒」、5400→「1小时30分」、20→「20秒」
+function fmtDur(sec) {
+  sec = Math.round(sec || 0);
+  if (sec < 60) return sec + '秒';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return s ? `${m}分${s}秒` : `${m}分`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? `${h}小时${mm}分` : `${h}小时`;
+}
 function fmtTime(ms) {
   if (!ms) return '';
   const d = new Date(ms);
@@ -1463,7 +1472,7 @@ const shotTray = {
     const el = document.createElement('div');
     el.className = 'shot-card';
     el.innerHTML = `
-      <img class="shot-thumb" draggable="true" src="/api/thumb?path=${encodeURIComponent(m.path)}&w=480&v=${m.size}" title="新截图 · 可拖进终端">
+      <img class="shot-thumb" draggable="true" src="/api/thumb?path=${encodeURIComponent(m.path)}&w=480&v=${m.size}" title="新截图 · 可拖进终端" data-retry="0">
       <div class="shot-info"><div class="shot-name">${escapeHtml(m.name)}</div>
       <div class="shot-acts">
         <button data-act="term" title="把路径喂给终端里的 agent">→ 终端</button>
@@ -1474,6 +1483,13 @@ const shotTray = {
     document.body.appendChild(el);
     this.el = el;
     const img = el.querySelector('.shot-thumb');
+    // 缩略图首次加载偶尔失败（文件刚写完、缩略图还在生成）：重试几次再放弃，别一裂到底
+    img.onerror = () => {
+      const n = +(img.dataset.retry || 0);
+      if (n >= 4) { img.style.visibility = 'hidden'; return; } // 实在不行就藏掉裂图，不难看
+      img.dataset.retry = n + 1;
+      setTimeout(() => { img.src = `/api/thumb?path=${encodeURIComponent(m.path)}&w=480&v=${m.size}&r=${n + 1}`; }, 400 * (n + 1));
+    };
     img.ondragstart = (ev) => ev.dataTransfer.setData('text/plain', m.path);
     img.onclick = () => lightbox(m.path);
     el.querySelector('[data-act=term]').onclick = () => { term.insertPath(m.path); this.dismiss(); };
@@ -2014,6 +2030,102 @@ function bindTerminalResizer() {
   });
 }
 
+// ---------- 微信 ClawBot：扫码把微信接到本机 OpenClaw（→ Claude Code / Codex），点图标看对话 ----------
+const wechatPanel = {
+  ov: null, offQr: null, offConn: null, pollTimer: null, onKey: null,
+  async open() {
+    if (!window.fanboxWechat) { toast('微信连接需在 FanBox 桌面版使用', true); return; }
+    if (this.ov) return;
+    const ov = document.createElement('div');
+    ov.className = 'input-overlay';
+    ov.innerHTML = `<div class="input-dialog wechat-dialog">
+      <div class="input-title">微信 ClawBot <span class="wx-sub">用微信驱动本机的 Claude Code / Codex</span></div>
+      <div class="wx-body"><div class="wx-loading">检测环境…</div></div>
+      <div class="input-actions"><button class="ghost-btn" data-act="close">关闭</button></div></div>`;
+    document.body.appendChild(ov);
+    this.ov = ov;
+    const close = () => this.close();
+    ov.querySelector('[data-act=close]').onclick = close;
+    ov.onclick = (ev) => { if (ev.target === ov) close(); };
+    this.onKey = (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); close(); } };
+    document.addEventListener('keydown', this.onKey, true);
+    await this.detect();
+  },
+  body() { return this.ov && this.ov.querySelector('.wx-body'); },
+  async detect() {
+    const env = await window.fanboxWechat.env().catch(() => ({ installed: false }));
+    if (!this.body()) return;
+    wechatPanel.syncDot(!!env.connected);
+    if (!env.installed) this.renderNeedInstall();
+    else if (env.connected) this.renderConnected(env);
+    else this.renderScan();
+  },
+  syncDot(on) { const d = $('#wechat-dot'); if (d) d.classList.toggle('hidden', !on); },
+  renderNeedInstall() {
+    const b = this.body(); if (!b) return;
+    b.innerHTML = `<div class="wx-step">
+      <p>还没装 OpenClaw（微信 ClawBot 的本机中转）。在终端跑这条装好后再回来：</p>
+      <pre class="wx-cmd">npm i -g openclaw</pre>
+      <button class="primary" data-act="recheck">装好了，重新检测</button></div>`;
+    b.querySelector('[data-act=recheck]').onclick = () => this.detect();
+  },
+  renderScan() {
+    this.teardownLogin();
+    const b = this.body(); if (!b) return;
+    b.innerHTML = `<div class="wx-scan"><div class="wx-qr"><div class="wx-loading">生成二维码…</div></div>
+      <p class="wx-hint">用手机微信「扫一扫」，在手机上点「连接」。<br>连上后这里会自动显示对话内容。</p></div>`;
+    this.offQr = window.fanboxWechat.onQr((m) => {
+      const qr = this.ov && this.ov.querySelector('.wx-qr'); if (!qr) return;
+      qr.innerHTML = m.dataUrl ? `<img class="wx-qr-img" src="${m.dataUrl}" alt="微信登录二维码">`
+        : `<p class="wx-hint">二维码生成失败，可在手机打开此链接：<br>${escapeHtml(m.url)}</p>`;
+    });
+    this.offConn = window.fanboxWechat.onConnected(async () => {
+      const env = await window.fanboxWechat.env().catch(() => ({ connected: true }));
+      this.renderConnected(env);
+    });
+    window.fanboxWechat.login().then((r) => {
+      if (r && !r.ok) { const qr = this.ov && this.ov.querySelector('.wx-qr'); if (qr) qr.innerHTML = `<p class="wx-hint">${escapeHtml(r.error || '启动登录失败')}</p>`; }
+    });
+  },
+  async renderConnected(env) {
+    this.teardownLogin();
+    this.syncDot(true);
+    const b = this.body(); if (!b) return;
+    const who = (env && env.agentModel) ? env.agentModel : '本机 agent';
+    b.innerHTML = `<div class="wx-conn">
+      <div class="wx-conn-bar"><span class="wx-on">● 已连接</span><span class="wx-who">微信 → ${escapeHtml(who)}</span><button class="ghost-btn wx-sm" data-act="disc">断开</button></div>
+      <div class="wx-chat"><div class="wx-loading">读取对话…</div></div></div>`;
+    b.querySelector('[data-act=disc]').onclick = async () => { await window.fanboxWechat.disconnect(); this.syncDot(false); this.renderScan(); };
+    await this.loadChat();
+    clearInterval(this.pollTimer);
+    this.pollTimer = setInterval(() => this.loadChat(), 4000); // 准实时刷新对话
+  },
+  async loadChat() {
+    const chat = this.ov && this.ov.querySelector('.wx-chat'); if (!chat) return;
+    const s = await window.fanboxWechat.sessions().catch(() => ({ items: [] }));
+    const sid = s.items && s.items[0] && s.items[0].id;
+    if (!sid) { chat.innerHTML = `<p class="wx-hint">还没有对话。去微信里给「微信ClawBot」发条消息试试。</p>`; return; }
+    const t = await window.fanboxWechat.transcript(sid).catch(() => ({ msgs: [] }));
+    const msgs = t.msgs || [];
+    if (!msgs.length) { chat.innerHTML = `<p class="wx-hint">还没有对话内容。</p>`; return; }
+    const last = msgs[msgs.length - 1];
+    const sig = msgs.length + ':' + (last.text || '').slice(0, 24);
+    if (chat.dataset.sig === sig) return; // 内容没变就不重渲染，别打断滚动
+    const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+    chat.innerHTML = msgs.map((m) => `<div class="wx-msg ${m.role === 'user' ? 'me' : 'bot'}">${escapeHtml(m.text)}</div>`).join('');
+    chat.dataset.sig = sig;
+    if (atBottom) chat.scrollTop = chat.scrollHeight;
+  },
+  teardownLogin() { if (this.offQr) { this.offQr(); this.offQr = null; } if (this.offConn) { this.offConn(); this.offConn = null; } },
+  close() {
+    this.teardownLogin();
+    clearInterval(this.pollTimer); this.pollTimer = null;
+    try { window.fanboxWechat && window.fanboxWechat.cancel(); } catch { /* */ }
+    if (this.onKey) { document.removeEventListener('keydown', this.onKey, true); this.onKey = null; }
+    if (this.ov) { this.ov.remove(); this.ov = null; }
+  },
+};
+
 // ---------- 事件绑定 ----------
 function bindEvents() {
   // 顶栏窄时分级藏低频控件（观测自身宽度而非视口——侧栏会吃掉一截且可折叠）
@@ -2030,6 +2142,9 @@ function bindEvents() {
   $('#cmdk-trigger').onclick = () => cmdk.open();
   $('#btn-recent').onclick = showRecent;
   $('#btn-changes').onclick = () => toggleChangesPanel();
+  $('#btn-wechat').onclick = () => wechatPanel.open();
+  // 启动时点一下连接状态，连着就给图标点个绿点（不挡初始化）
+  if (window.fanboxWechat) window.fanboxWechat.env().then((e) => wechatPanel.syncDot(!!(e && e.connected))).catch(() => {});
   $('#btn-terminal').onclick = () => term.toggle();
   $('#term-claude').onclick = () => term.launchAgent('claude --dangerously-skip-permissions');
   $('#term-codex').onclick = () => term.launchAgent('codex');
@@ -2044,6 +2159,7 @@ function bindEvents() {
     term.toggleMax();
   });
   $('#term-dock').onclick = () => term.setDock(term.dock === 'bottom' ? 'right' : 'bottom');
+  $('#term-replay').onclick = () => player.open();
   const muteBtn = $('#term-mute');
   const syncMute = () => { muteBtn.textContent = state.muted ? '🔕' : '🔔'; muteBtn.title = state.muted ? '提示音已关（点击开启）' : '提示音已开（点击静音）'; };
   syncMute();
@@ -2149,7 +2265,17 @@ function bindEvents() {
   $('#cmdk-input').oninput = (e) => cmdk.search(e.target.value);
   $('#cmdk').onclick = (e) => { if (e.target.id === 'cmdk') cmdk.close(); };
 
+  // 启动必为干净态：录像弹窗永远不在 app 打开时默认显示（HTML 已带 hidden，这里再兜一道）
+  try { $('#replay-overlay').classList.add('hidden'); } catch { /* */ }
+  // 录像弹窗的「保命逃生口」：不管 player 内部状态坏没坏，ESC 一定先把弹窗 DOM 藏掉，绝不困住用户
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('#replay-overlay').classList.contains('hidden')) {
+      $('#replay-overlay').classList.add('hidden');
+      try { player.close(); } catch { /* player 坏了也没关系，上面已经把弹窗藏了 */ }
+    }
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (!$('#replay-overlay').classList.contains('hidden')) return; // 录像回放开着时，交给它自己的快捷键
     if (e.key === 'Escape' && $('#context-menu')) { closeContextMenu(); return; }
     const cmdkOpen = !$('#cmdk').classList.contains('hidden');
     const lbOpen = !!document.querySelector('.lightbox');
@@ -2210,6 +2336,288 @@ function applyTheme(skin, rerender = true) {
   }
 }
 
+// ---------- 终端录像回放（黑匣子的播放端）----------
+// 保真铁律：用和 live 终端完全相同的 xterm 配置（主题/字体/unicode11/对比度）回放原始字节流，
+// 画面就和当时逐像素一致。时间压缩是非破坏性变换（idle 封顶 + 目标时长反推 + 倍速），原始 .cast 不动。
+const player = {
+  xterm: null, raw: [], timeline: [], duration: 0, currentTime: 0, cursor: 0,
+  playing: false, _raf: 0, _wallStart: 0, _host: null, _canvasOk: false,
+  initCols: 80, initRows: 24, cols: 80, rows: 24, current: null, _wired: false,
+  opts: { idleCap: 1, target: 60, speed: 1 },
+
+  async open() {
+    const ov = $('#replay-overlay');
+    if (!ov) return;
+    if (!ov.classList.contains('hidden')) return; // 已打开，别重复绑监听（否则 keydown/resize 泄漏）
+    ov.classList.remove('hidden');
+    this._host = $('#replay-host');
+    if (!this._wired) this.wire();
+    this._onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); this.close(); }
+      else if (e.key === ' ' && this.timeline.length && !/SELECT|INPUT/.test((e.target.tagName || ''))) { e.preventDefault(); this.toggle(); }
+    };
+    this._onResize = () => { clearTimeout(this._resizeT); this._resizeT = setTimeout(() => this.rescale(), 120); };
+    document.addEventListener('keydown', this._onKey, true);
+    window.addEventListener('resize', this._onResize);
+    await this.loadList();
+  },
+  close() {
+    // 铁律：关闭永远无条件成功。先把弹窗藏掉（用户立刻解脱），再做清理；任何一步抛错都不许挡住关闭。
+    try { $('#replay-overlay').classList.add('hidden'); } catch { /* */ }
+    this._exporting = false; // 导出中也允许关：终止导出，不再阻塞
+    try { this.pause(); } catch { /* */ }
+    try { if (this._onKey) document.removeEventListener('keydown', this._onKey, true); } catch { /* */ }
+    try { if (this._onResize) window.removeEventListener('resize', this._onResize); } catch { /* */ }
+    try { this.teardownTerm(); } catch { /* */ }
+    this.current = null;
+  },
+  teardownTerm() {
+    if (this.xterm) { try { this.xterm.dispose(); } catch { /* */ } this.xterm = null; }
+    if (this._host) this._host.innerHTML = '';
+  },
+  wire() {
+    this._wired = true;
+    $('#replay-close').onclick = () => this.close();
+    $('#replay-overlay').addEventListener('mousedown', (e) => { if (e.target.id === 'replay-overlay') this.close(); });
+    $('#rp-play').onclick = () => this.toggle();
+    // 拖动 seek 用 rAF 节流：大录像每次 seek 是 O(N) 重放，不节流会卡死主线程
+    $('#rp-seek').addEventListener('input', (e) => { this.pause(); this._seekTo = this.duration * (e.target.value / 1000); if (this._seekRAF) return; this._seekRAF = requestAnimationFrame(() => { this._seekRAF = 0; this.seekTo(this._seekTo); }); });
+    $('#rp-idle').addEventListener('change', (e) => { this.opts.idleCap = parseFloat(e.target.value); this.recompute(); this.seekTo(this.firstAt); });
+    $('#rp-target').addEventListener('change', (e) => { this.opts.target = e.target.value ? parseFloat(e.target.value) : null; this.recompute(); this.seekTo(this.firstAt); });
+    $('#rp-speed').addEventListener('change', (e) => { this.opts.speed = parseFloat(e.target.value); this.recompute(); this.seekTo(this.firstAt); });
+    $('#rp-export').onclick = () => this.exportVideo();
+  },
+  async loadList() {
+    const box = $('#replay-list');
+    if (!window.fanboxRec) { box.innerHTML = '<div class="replay-empty-list">录像功能仅在桌面 App 内可用。</div>'; return; }
+    const r = await window.fanboxRec.list().catch(() => null);
+    const items = (r && r.items) || [];
+    if (!items.length) { box.innerHTML = '<div class="replay-empty-list">还没有录像。<br>打开一个终端跑跑 agent，<br>这里会自动出现黑匣子。</div>'; return; }
+    box.innerHTML = '';
+    items.forEach((it) => {
+      const el = document.createElement('div');
+      el.className = 'rp-item' + (this.current && this.current.path === it.path ? ' active' : '');
+      const when = new Date(it.startedAt || it.mtime);
+      const title = (it.cwd ? baseOf(it.cwd) : '') || it.name.replace(/\.cast$/, '');
+      const dur = it.duration ? fmtDur(it.duration) + ' · ' : '';
+      el.innerHTML = `<div class="rp-item-top">${it.recording ? '<span class="rp-dot-live" title="正在录"></span>' : ''}<span>${escapeHtml(title)}</span><span class="rp-item-del" title="删除">✕</span></div>`
+        + `<div class="rp-item-sub">${dur}${when.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · ${fmtSize(it.size)}</div>`;
+      el.querySelector('.rp-item-del').onclick = async (ev) => { ev.stopPropagation(); if (await confirmDialog('删除这段录像？')) { await window.fanboxRec.remove(it.path); this.loadList(); } };
+      el.onclick = () => this.select(it);
+      box.appendChild(el);
+    });
+  },
+  async select(it) {
+    if (this._exporting) { toast('导出进行中，请稍候…', true); return; } // 导出中切换会绑错画布产坏文件
+    const r = await window.fanboxRec.read(it.path).catch(() => null);
+    if (!r || !r.ok) { toast('读取录像失败', true); return; }
+    let header = null; const raw = [];
+    for (const line of r.text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const v = JSON.parse(line);
+        if (!header && !Array.isArray(v)) { header = v; continue; }
+        if (Array.isArray(v) && (v[1] === 'o' || v[1] === 'r')) raw.push({ t: v[0], code: v[1], data: v[2] });
+      } catch { /* 跳过坏行 */ }
+    }
+    if (!header) { toast('录像为空或损坏', true); return; }
+    this.current = it;
+    this.raw = raw;
+    this.recTheme = (header.fanbox && header.fanbox.theme) || ''; // 录制时的皮肤：回放用它，颜色才和当时一致
+    this.initCols = this.cols = header.width || 80;
+    this.initRows = this.rows = header.height || 24;
+    $('#replay-empty').style.display = 'none';
+    $('#replay-controls').classList.remove('hidden');
+    this.loadList(); // 刷新选中态
+    this.buildTerm(this.initCols, this.initRows);
+    this.recompute();
+    this.seekTo(this.firstAt); // 选中即停在第一帧内容上，不再是空屏
+    setTimeout(() => { if (this.current === it) this.play(); }, 400); // 自动播放：选中即「活」起来
+  },
+  buildTerm(cols, rows) {
+    this.teardownTerm();
+    const x = new window.Terminal({
+      fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--font-term').trim() || 'monospace',
+      fontSize: 14, lineHeight: 1.2, cursorBlink: false, theme: (term.themes[this.recTheme] || term.theme()), scrollback: 0,
+      allowProposedApi: true, minimumContrastRatio: 4.5, cols, rows,
+    });
+    if (!window.__noUnicode11 && window.Unicode11Addon) {
+      try { const U = window.Unicode11Addon.Unicode11Addon || window.Unicode11Addon; x.loadAddon(new U()); x.unicode.activeVersion = '11'; } catch { /* */ }
+    }
+    x.open(this._host);
+    this._canvasOk = false;
+    if (!window.__noWebgl && window.WebglAddon) {
+      try { const W = window.WebglAddon.WebglAddon || window.WebglAddon; const w = new W(); w.onContextLoss(() => { try { w.dispose(); } catch { /* */ } }); x.loadAddon(w); this._canvasOk = true; } catch { /* 回退 DOM renderer：回放仍可，导出降级 */ }
+    }
+    this.xterm = x;
+    requestAnimationFrame(() => this.rescale());
+  },
+  // 不改 cols×rows（保证折行和当时一致），用 CSS transform 缩放整块以适配舞台
+  rescale() {
+    const screen = $('#replay-screen'), host = this._host;
+    if (!screen || !host || !this.xterm) return;
+    const el = host.querySelector('.xterm');
+    if (!el) return;
+    host.style.transform = 'none';
+    const natW = el.offsetWidth, natH = el.offsetHeight;
+    if (!natW || !natH) return;
+    const scale = Math.min((screen.clientWidth - 32) / natW, (screen.clientHeight - 32) / natH);
+    host.style.transform = `scale(${Math.max(0.1, scale)})`;
+  },
+  // 非破坏性时间变换。要害：压「等待」不压「流式输出」——把 2h 压成 1min 时，
+  // 被牺牲的应该是 agent 思考/装依赖的长静默，而连续吐字的节奏要原样保留，否则糊成闪屏。
+  recompute() {
+    const STREAM = 0.25; // ≤这个间隔算「流式输出节奏」，保留；更大的算「等待」，可压
+    const cap = this.opts.idleCap || 9999;
+    const target = this.opts.target;
+    const manual = this.opts.speed || 1;
+    // 1) 先按 idleCap 压每个间隔（封顶长等待）
+    let prev = 0; const gaps = [];
+    for (const e of this.raw) { let g = e.t - prev; prev = e.t; if (g < 0) g = 0; if (g > cap) g = cap; gaps.push({ g, code: e.code, data: e.data }); }
+    // 2) 设了目标时长：把「等待段」等比压缩去凑目标，「流式段」原样不动；
+    //    若光流式段就超目标，宁可超时也保可读（不把连续输出提速成闪屏）
+    if (target) {
+      let streamSum = 0, idleSum = 0;
+      for (const x of gaps) { if (x.g <= STREAM) streamSum += x.g; else idleSum += x.g; }
+      const idleBudget = Math.max(0, target - streamSum);
+      if (idleSum > idleBudget && idleSum > 0) { const k = idleBudget / idleSum; for (const x of gaps) if (x.g > STREAM) x.g *= k; }
+    }
+    // 3) 手动倍速叠加，累加成时间轴
+    let acc = 0; const tl = [];
+    for (const x of gaps) { acc += x.g / manual; tl.push({ at: acc, code: x.code, data: x.data }); }
+    this.timeline = tl;
+    this.duration = acc;
+    const fo = tl.find((x) => x.code === 'o'); // 第一帧有内容的时刻：避开开头空白，选中即见画面
+    this.firstAt = fo ? fo.at : 0;
+    this.updateTime();
+  },
+  apply(e) {
+    if (!this.xterm) return; // 回放中被关闭/切换会 dispose xterm，这里要挡住空引用
+    if (e.code === 'o') this.xterm.write(e.data);
+    else if (e.code === 'r') { const m = /^(\d+)x(\d+)$/.exec(e.data); if (m) { try { this.xterm.resize(+m[1], +m[2]); } catch { /* */ } requestAnimationFrame(() => this.rescale()); } }
+  },
+  seekTo(t) {
+    if (!this.xterm) return;
+    t = Math.max(0, Math.min(t, this.duration || 0));
+    // 后退才从头重放（终端是有状态的，回退必须重建）；前进只从当前 cursor 增量喂，
+    // 这样拖动长录像的进度条不会每次都 O(N) 全量重放卡死
+    if (t < this.currentTime - 1e-6) {
+      try { this.xterm.reset(); this.xterm.resize(this.initCols, this.initRows); } catch { /* */ }
+      this.cursor = 0;
+    }
+    let buf = ''; let resized = false;
+    for (; this.cursor < this.timeline.length && this.timeline[this.cursor].at <= t; this.cursor++) {
+      const e = this.timeline[this.cursor];
+      if (e.code === 'o') buf += e.data;
+      else if (e.code === 'r') { if (buf) { this.xterm.write(buf); buf = ''; } const m = /^(\d+)x(\d+)$/.exec(e.data); if (m) { try { this.xterm.resize(+m[1], +m[2]); resized = true; } catch { /* */ } } }
+    }
+    if (buf) this.xterm.write(buf);
+    if (resized) requestAnimationFrame(() => this.rescale());
+    this.currentTime = t;
+    if (this.playing) this._wallStart = performance.now() - t * 1000;
+    this.updateTime();
+  },
+  toggle() { this.playing ? this.pause() : this.play(); },
+  play() {
+    if (!this.timeline.length) return;
+    if (this.cursor >= this.timeline.length || this.currentTime >= this.duration - 1e-3) this.seekTo(0);
+    this.playing = true;
+    this._wallStart = performance.now() - this.currentTime * 1000;
+    this.setPlayIcon(true);
+    this._raf = requestAnimationFrame(() => this.tick());
+  },
+  pause() {
+    this.playing = false;
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this.setPlayIcon(false);
+  },
+  tick() {
+    if (!this.playing || !this.xterm) return;
+    const now = (performance.now() - this._wallStart) / 1000;
+    while (this.cursor < this.timeline.length && this.timeline[this.cursor].at <= now) this.apply(this.timeline[this.cursor++]);
+    this.currentTime = Math.min(now, this.duration);
+    this.updateTime();
+    if (this.cursor >= this.timeline.length) { this.currentTime = this.duration; this.updateTime(); this.pause(); return; }
+    this._raf = requestAnimationFrame(() => this.tick());
+  },
+  setPlayIcon(playing) {
+    const b = $('#rp-play');
+    if (b) b.innerHTML = playing
+      ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>'
+      : '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+  },
+  updateTime() {
+    const f = (s) => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+    const tEl = $('#rp-time'); if (tEl) tEl.textContent = `${f(this.currentTime)} / ${f(this.duration)}`;
+    const sk = $('#rp-seek'); if (sk && document.activeElement !== sk) sk.value = this.duration ? String(Math.round(this.currentTime / this.duration * 1000)) : 0;
+  },
+  exportVideo() { exportReplay(this); },
+  // 入口发现性：有录像时给回放按钮点一个小红点（飞行记录仪默默录了一堆，得让用户知道能回看）
+  async refreshHint() {
+    if (!window.fanboxRec) return;
+    const btn = $('#term-replay'); if (!btn) return;
+    try { const r = await window.fanboxRec.list(); btn.classList.toggle('has-rec', !!(r && r.items && r.items.length)); } catch { /* */ }
+  },
+};
+
+// 导出：直接对回放用的 xterm canvas 做 captureStream + MediaRecorder——
+// 录的就是播放器画面本身，和你看到的逐像素一致，零外部依赖。手动 requestFrame 保证静止段也出帧。
+async function exportReplay(p) {
+  if (!p.xterm || !p.timeline.length) { toast('先在左侧选一段录像', true); return; }
+  if (!p._canvasOk) { toast('导出需要 WebGL 渲染，当前不可用', true); return; }
+  if (!window.MediaRecorder) { toast('当前环境不支持录制导出', true); return; }
+  // 选 WebGL 渲染那块画布（另一块 xterm-link-layer 是空覆盖层）。WebGL 不保留 drawing buffer，
+  // 必须用 captureStream(fps) 的「自动模式」在合成器层面取帧——手动 requestFrame 取到的是空白。
+  const canvases = [...p._host.querySelectorAll('canvas')];
+  const canvas = canvases.find((c) => { try { return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch { return false; } }) || canvases[canvases.length - 1];
+  if (!canvas) { toast('找不到画布，无法导出', true); return; }
+  let stream;
+  try { stream = canvas.captureStream(30); } catch { toast('画布捕获失败', true); return; }
+  // 渲染层固定录 WebM（Electron 的 MediaRecorder 最稳的就是 vp9/webm），mp4/gif 交给主进程 ffmpeg 转
+  const mime = ['video/webm;codecs=vp9', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  const chunks = [];
+  let mr;
+  try { mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8000000 }); }
+  catch { toast('无法初始化录制器', true); return; }
+  mr.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  const stopped = new Promise((res) => { mr.onstop = res; });
+  const btn = $('#rp-export'); const label = btn.textContent;
+  p._exporting = true; // 导出期间禁止切换/关闭，避免绑错画布产坏文件
+  btn.disabled = true;
+  try {
+    p.pause(); p.seekTo(0);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); // 等画布稳定
+    mr.start(100); // timeslice：周期性产出数据块，短录像也不丢
+    p.play();
+    // 导出是实时录屏（播一遍就是多久），进度条给用户反馈，别让人以为卡死
+    const prog = setInterval(() => { btn.textContent = '录制中 ' + Math.min(99, Math.round(p.currentTime / (p.duration || 1) * 100)) + '%'; }, 200);
+    await new Promise((res) => { const iv = setInterval(() => { if (!p.playing) { clearInterval(iv); res(); } }, 80); });
+    clearInterval(prog);
+    await new Promise((r) => setTimeout(r, 500)); // 末帧多停一拍
+    try { mr.stop(); } catch { /* */ }
+    await stopped;
+    try { stream.getTracks().forEach((t) => t.stop()); } catch { /* */ }
+    if (!chunks.length) { toast('没有捕获到画面（导出需要 WebGL）', true); return; }
+    const fmt = ($('#rp-format') && $('#rp-format').value) || 'mp4';
+    btn.textContent = fmt === 'webm' ? '保存中…' : '转码中…';
+    const blob = new Blob(chunks, { type: mime });
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    const tag = (p.current && p.current.cwd && baseOf(p.current.cwd)) || 'session';
+    const name = `终端录像-${tag}-${fmtStamp()}`;
+    // 渲染层永远产 WebM，交给主进程按 fmt 用 ffmpeg 转 mp4/gif（无 ffmpeg 自动退回 webm）
+    const r = await window.fanboxRec.export(name, buf, fmt).catch(() => null);
+    if (r && r.ok) { toast('已导出 ' + baseOf(r.path) + (r.fellBack ? '（' + r.fellBack + '）' : '') + '，在访达打开'); window.fanboxRec.reveal(r.path); }
+    else { toast('导出失败' + (r && r.error ? '：' + r.error : ''), true); }
+  } finally {
+    p._exporting = false; btn.disabled = false; btn.textContent = label;
+  }
+}
+function fmtStamp() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+}
+
 // ---------- 内嵌终端（仅桌面 app；浏览器版优雅降级）----------
 // agent「等你拍板」界面特征（claude code 2.1.x / codex 0.13x 实测文案，宁缺勿滥：
 // 不命中只是退化成「任务完成」标题，不会漏响）
@@ -2249,6 +2657,7 @@ const term = {
     if (!this.sessions.length) this.newTab();
     else this.fitActive();
     $('#btn-terminal').classList.add('active');
+    player.refreshHint(); // 有录像就给回放按钮点红点，提升发现性
     localStorage.setItem('fb_term_open', '1');
     if (!localStorage.getItem('fb_term_draghint')) { localStorage.setItem('fb_term_draghint', '1'); setTimeout(() => toast('提示：把左侧文件 / 文件夹拖进终端，即插入路径喂给 agent'), 700); }
   },
@@ -2513,7 +2922,7 @@ const term = {
     this.sessions.push(sess);
     this.activate(id);
     updateWatches(); // 新终端的项目目录也纳入监听
-    const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows });
+    const r = await window.fanboxPty.spawn({ id, cwd: startDir, cols: xterm.cols, rows: xterm.rows, theme: state.theme });
     if (!r.ok) { sess.dead = true; xterm.write('\r\n  \x1b[31m终端启动失败：' + (r.error || '') + '\x1b[0m\r\n'); }
     else sess.cwd = r.cwd || startDir; // 末尾 renderTabs 统一带上 cwd 重画
     xterm.onData((d) => {

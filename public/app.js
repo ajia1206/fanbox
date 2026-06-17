@@ -3673,15 +3673,29 @@ const usagePanel = {
 // ---------- Skills 透视（主区全屏视图）----------
 const skillsView = {
   data: null, filter: 'all', sort: 'hits', open: new Set(),
+  url(force) {
+    const roots = new Set();
+    if (state.cwd) roots.add(state.cwd);
+    if (typeof term !== 'undefined') term.sessions.forEach((s) => {
+      if (s.cwd) roots.add(s.cwd);
+      if (s.startDir) roots.add(s.startDir);
+    });
+    const qs = new URLSearchParams();
+    const arr = [...roots].filter(Boolean).slice(0, 24);
+    if (arr.length) qs.set('roots', arr.join('\n'));
+    if (force) qs.set('force', '1');
+    return '/api/skills' + (qs.toString() ? '?' + qs.toString() : '');
+  },
+  load(force) { return api(this.url(force)); },
   async show() {
     state.skillsMode = true; state.recentMode = false; state.cursor = -1;
     renderBreadcrumb();
     $('#file-area').innerHTML = '<div class="cmdk-loading">扫描本机 skills…</div>';
-    try { this.data = await api('/api/skills'); } catch { $('#file-area').innerHTML = '<div class="nav-empty">扫描失败</div>'; return; }
+    try { this.data = await this.load(true); } catch { $('#file-area').innerHTML = '<div class="nav-empty">扫描失败</div>'; return; }
     this.render();
   },
-  async reload() {
-    try { this.data = await api('/api/skills'); if (state.skillsMode) this.render(); } catch { /* */ }
+  async reload(force) {
+    try { this.data = await this.load(force); if (state.skillsMode) this.render(); return true; } catch { return false; }
   },
   srcTag(it) {
     const cls = { claude: '', codex: ' codex', agents: ' codex', plugin: ' plugin', project: ' proj' }[it.source] || '';
@@ -3738,6 +3752,7 @@ const skillsView = {
              ['bad', '仅看问题', o.issues]]
             .map(([k, lbl, n]) => `<button class="sk-chip ${this.filter === k ? 'on' : ''}" data-f="${k}">${lbl} <i>${n}</i></button>`).join('')}
         </div>
+        <button class="ghost-btn sk-refresh" data-act="refresh-skills" type="button">刷新</button>
         <select class="sk-sort" id="sk-sort">
           <option value="hits" ${this.sort === 'hits' ? 'selected' : ''}>按触发次数</option>
           <option value="recent" ${this.sort === 'recent' ? 'selected' : ''}>按最后触发</option>
@@ -3796,6 +3811,15 @@ const skillsView = {
     this.bind(area);
   },
   bind(area) {
+    const refresh = area.querySelector('[data-act="refresh-skills"]');
+    if (refresh) refresh.onclick = async (e) => {
+      e.stopPropagation();
+      refresh.disabled = true;
+      refresh.textContent = '扫描中…';
+      const ok = await this.reload(true);
+      toast(ok ? '已刷新 skills' : '扫描失败', !ok);
+      if (!ok) { refresh.disabled = false; refresh.textContent = '刷新'; }
+    };
     area.querySelector('.sk-chips').onclick = (e) => {
       const c = e.target.closest('.sk-chip'); if (!c) return;
       this.filter = c.dataset.f; this.render();

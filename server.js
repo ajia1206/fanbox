@@ -1635,7 +1635,7 @@ async function agentProjects() {
 }
 
 // ---------- Skills 透视（本机 agent skills 的扫描 / 触发统计 / 健康检查 / 启停）----------
-// 扫描五类来源：~/.claude/skills、最近 agent 项目的 .claude/skills、Claude 插件、
+// 扫描来源：~/.claude/skills、当前/最近 agent 项目的项目级 skills、Claude 插件、
 // ~/.codex/skills、~/.agents/skills。触发统计读两家的会话日志。
 // 启停不走 skillOverrides（官方 #50631：用户级配置当前不生效）——用「移入 _disabled/ 子目录」
 // 实现：两家 CLI 都只扫一层目录，移进去立即对模型不可见，移回来即恢复，可靠且可逆。
@@ -1644,7 +1644,12 @@ const CODEX_SKILLS = path.join(HOME, '.codex', 'skills');
 const AGENTS_SKILLS = path.join(HOME, '.agents', 'skills');
 const SKILL_DESC_CUT = 1536; // Claude Code 单条 description 的截断线（官方文档）
 const SKILL_BUDGET_CHARS = 15000; // 描述总预算的社区实测估算值（窗口的 1%），仅作预警参考
-let skillsCache = { at: 0, data: null };
+const PROJECT_SKILL_DIRS = [
+  { rel: path.join('.claude', 'skills'), suffix: '' },
+  { rel: path.join('.codex', 'skills'), suffix: '/.codex' },
+  { rel: path.join('.agents', 'skills'), suffix: '/.agents' },
+];
+let skillsCache = { at: 0, key: '', data: null };
 
 function skillFrontmatter(txt) {
   const m = txt.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
@@ -1704,6 +1709,68 @@ async function scanSkillRoot(root, source, label, out, disabled = false) {
       item.issues.push('缺 SKILL.md——不是有效 skill');
     }
     out.push(item);
+  }
+}
+
+function parseSkillContextRoots(raw) {
+  const roots = [];
+  const seen = new Set();
+  for (const line of String(raw || '').split('\n')) {
+    const v = line.trim();
+    if (!v || v.includes('\0')) continue;
+    let abs;
+    try { abs = resolvePath(v); } catch { continue; }
+    if (seen.has(abs) || abs === HOME) continue;
+    seen.add(abs);
+    roots.push(abs);
+    if (roots.length >= 24) break;
+  }
+  return roots;
+}
+
+async function hasProjectSkillRoot(dir) {
+  for (const it of PROJECT_SKILL_DIRS) {
+    try { if ((await fsp.stat(path.join(dir, it.rel))).isDirectory()) return true; } catch { /* */ }
+  }
+  return false;
+}
+
+async function findProjectSkillRoot(p) {
+  let cur = resolvePath(p);
+  try {
+    const st = await fsp.stat(cur);
+    if (!st.isDirectory()) cur = path.dirname(cur);
+  } catch { return null; }
+  while (true) {
+    if (await hasProjectSkillRoot(cur)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+async function contextProjectRoots(paths) {
+  const out = [];
+  const seen = new Set();
+  for (const p of paths || []) {
+    const root = await findProjectSkillRoot(p).catch(() => null);
+    if (!root || seen.has(root)) continue;
+    seen.add(root);
+    out.push({ path: root, name: path.basename(root) || root });
+  }
+  return out;
+}
+
+async function scanProjectSkillRoots(projects, out, seenRoots) {
+  for (const p of projects || []) {
+    if (!p || !p.path) continue;
+    for (const it of PROJECT_SKILL_DIRS) {
+      const root = path.join(p.path, it.rel);
+      const key = path.resolve(root);
+      if (seenRoots.has(key)) continue;
+      seenRoots.add(key);
+      await scanSkillRoot(root, 'project', (p.name || path.basename(p.path) || 'project') + it.suffix, out);
+    }
   }
 }
 
@@ -1807,8 +1874,10 @@ async function codexSkillEvents(cutoff) {
   return all;
 }
 
-async function skillsData() {
-  if (skillsCache.data && Date.now() - skillsCache.at < 30000) return skillsCache.data;
+async function skillsData(opts = {}) {
+  const contextRoots = (opts.contextRoots || []).slice(0, 24);
+  const cacheKey = contextRoots.join('\0');
+  if (!opts.force && skillsCache.data && skillsCache.key === cacheKey && Date.now() - skillsCache.at < 30000) return skillsCache.data;
   const cutoff = Date.now() - 45 * 86400000;
   const items = [];
   await scanSkillRoot(CLAUDE_SKILLS, 'claude', '~/.claude', items);
@@ -1823,12 +1892,14 @@ async function skillsData() {
       }
     }
   } catch { /* 没装插件 */ }
-  // 最近 agent 项目的项目级 skills
+  // 当前浏览/终端上下文 + 最近 agent 项目的项目级 skills
+  const seenProjectSkillRoots = new Set();
+  try {
+    await scanProjectSkillRoots(await contextProjectRoots(contextRoots), items, seenProjectSkillRoots);
+  } catch { /* */ }
   try {
     const pj = await agentProjects();
-    for (const p of pj.projects || []) {
-      await scanSkillRoot(path.join(p.path, '.claude', 'skills'), 'project', p.name, items);
-    }
+    await scanProjectSkillRoots(pj.projects || [], items, seenProjectSkillRoots);
   } catch { /* */ }
 
   // 触发统计合并（按 skill 名聚合两端事件）
@@ -1877,7 +1948,7 @@ async function skillsData() {
       budgetChars, budgetLimit: SKILL_BUDGET_CHARS, descCut: SKILL_DESC_CUT,
     },
   };
-  skillsCache = { at: Date.now(), data };
+  skillsCache = { at: Date.now(), key: cacheKey, data };
   return data;
 }
 
@@ -1912,7 +1983,7 @@ async function skillToggle(dir, enable) {
       await fsp.rename(it.dir, dest);
     }
   } catch (e) { return { ok: false, error: e.message }; }
-  skillsCache = { at: 0, data: null };
+  skillsCache = { at: 0, key: '', data: null };
   return { ok: true, dir: dest };
 }
 
@@ -1920,7 +1991,7 @@ async function skillTrash(dir) {
   const v = await validateSkillDir(dir);
   if (!v.ok) return v;
   const r = await trashPath(v.item.dir);
-  if (r.ok) skillsCache = { at: 0, data: null };
+  if (r.ok) skillsCache = { at: 0, key: '', data: null };
   return r;
 }
 
@@ -2090,7 +2161,10 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, await agentProjects());
     }
     if (p === '/api/skills') {
-      return sendJSON(res, 200, await skillsData());
+      return sendJSON(res, 200, await skillsData({
+        contextRoots: parseSkillContextRoots(qp.get('roots')),
+        force: qp.get('force') === '1',
+      }));
     }
     if (p === '/api/skills/toggle' && req.method === 'POST') {
       const b = await readBody(req);

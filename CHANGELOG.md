@@ -19,6 +19,7 @@
 - **文件跟随没有跳到终端**：开启文件跟随时会自动打开并切回被绑定的终端 tab，让“盯着哪个 agent”有明确上下文。
 - **内嵌终端复制粘贴不稳定**：新增文本剪贴板桥接，终端支持 `⌘V` bracketed paste、`⌘C` 复制选区，并保留菜单/系统 paste 事件兜底。
 - **打包终端回归无自动校验**：新增 `npm run verify:dist-terminal` 和 `npm run dist:verify`，可对已生成的 `.app` 执行 node-pty 启动 smoke test。
+- **项目内新增 skills 未加载**：Skills 透视现在会扫描当前浏览目录和所有终端目录向上找到的项目级 `.claude/.codex/.agents` skills，并提供手动刷新按钮，新增后不用等 agent 会话记录出现。
 
 ## [1.13.0] - 2026-06-17
 

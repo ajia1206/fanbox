@@ -13,7 +13,9 @@
     "build:milkdown": "esbuild src-vendor/milkdown-entry.js --bundle --format=iife --minify --outfile=public/vendor/milkdown/milkdown.js --loader:.svg=dataurl --loader:.woff=file --loader:.woff2=file --loader:.ttf=file --loader:.eot=file --asset-names=[name]",
     "build:hljs": "esbuild src-vendor/hljs-entry.js --bundle --format=iife --minify --outfile=public/vendor/hljs/highlight.js && cp node_modules/marked/marked.min.js public/vendor/marked/marked.min.js && cp node_modules/highlight.js/styles/github-dark.min.css node_modules/highlight.js/styles/github.min.css public/vendor/hljs/styles/",
     "check:vendor-patch": "grep -q '20===e.keyCode||229===e.keyCode' public/vendor/xterm/xterm.js",
-    "predist": "npm run check:vendor-patch",
+    "fix:node-pty-perms": "node scripts/ensure-node-pty-perms.js",
+    "postinstall": "npm run fix:node-pty-perms",
+    "predist": "npm run check:vendor-patch && npm run fix:node-pty-perms",
     "dist": "electron-builder --mac"
   },
   "build": {

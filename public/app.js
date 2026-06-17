@@ -2206,6 +2206,7 @@ function bindEvents() {
   $('#preview-close').onclick = closePreview;
   $('#cmdk-trigger').onclick = () => cmdk.open();
   $('#btn-recent').onclick = showRecent;
+  $('#btn-agent-queue').onclick = () => agentQueue.toggle();
   $('#btn-changes').onclick = () => toggleChangesPanel();
   $('#btn-wechat').onclick = () => wechatPanel.open();
   // 启动时点一下连接状态，连着就给图标点个绿点（不挡初始化）
@@ -2890,6 +2891,7 @@ const term = {
     const s = this.sessions.find((x) => x.id === id);
     if (s) {
       s.lastInput = Date.now();
+      if (s.needsInput) { s.needsInput = false; s.waitClearedAt = s.lastInput; s.lastOutcome = 'running'; s.lastOutcomeAt = s.lastInput; agentQueue.refresh(); }
       // 回车多半提交了条命令（cd 这类被回显过滤、不走 busy 周期），稍后把标题对齐真实目录
       if (d.indexOf('\r') !== -1) { clearTimeout(s._cwdT); s._cwdT = setTimeout(() => this.refreshCwd(s, true), 800); }
     }
@@ -2981,6 +2983,7 @@ const term = {
       if (r && r.ok && r.cwd && r.cwd !== s.cwd) {
         s.cwd = r.cwd; s.title = baseOf(r.cwd) || s.title;
         this.renderTabs(); renderBreadcrumb(); // 面包屑的项目配对色点也跟着换
+        agentQueue.refresh();
       }
     } catch { /* 取不到就保持原标题 */ }
   },
@@ -3037,7 +3040,10 @@ const term = {
       } catch { /* 回退默认 DOM renderer */ }
     }
     if (fit) try { fit.fit(); } catch { /* */ }
-    const sess = { id, xterm, fit, host, dead: false, status: 'idle', unread: false, startDir, title: baseOf(startDir || '') || 'shell' };
+    const sess = {
+      id, xterm, fit, host, dead: false, status: 'idle', unread: false, startDir, title: baseOf(startDir || '') || 'shell',
+      needsInput: false, waitClearedAt: 0, lastOutcome: 'idle', lastOutcomeAt: 0, lastExcerpt: '', lastDuration: 0,
+    };
     this.sessions.push(sess);
     this.activate(id);
     updateWatches(); // 新终端的项目目录也纳入监听
@@ -3171,14 +3177,16 @@ const term = {
       });
     }
     this.renderTabs();
+    agentQueue.refresh();
     return sess;
   },
   async respawn(sess) {
-    sess.dead = false;
+    sess.dead = false; sess.needsInput = false; sess.waitClearedAt = 0; sess.lastOutcome = 'running'; sess.lastOutcomeAt = Date.now(); sess.lastExcerpt = '';
     sess.xterm.reset(); // 清掉死亡残留，新 shell 提示符不和旧画面叠在一起
     const r = await window.fanboxPty.spawn({ id: sess.id, cwd: sess.startDir || state.cwd, cols: sess.xterm.cols, rows: sess.xterm.rows });
     if (!r.ok) { sess.dead = true; sess.xterm.write('\x1b[31m重开失败：' + (r.error || '') + '\x1b[0m\r\n'); }
     else sess.cwd = r.cwd || sess.startDir;
+    agentQueue.refresh();
   },
   activate(id) {
     this.active = id;
@@ -3206,9 +3214,10 @@ const term = {
     s.host.remove();
     this.sessions.splice(i, 1);
     updateWatches(); // 该终端的项目目录不再需要监听
-    if (!this.sessions.length) { this.close(); return; }
+    if (!this.sessions.length) { this.close(); agentQueue.refresh(); return; }
     if (this.active === id) this.activate(this.sessions[Math.max(0, i - 1)].id);
     else this.renderTabs();
+    agentQueue.refresh();
   },
   fitActive() {
     const s = this.sessions.find((x) => x.id === this.active);
@@ -3224,9 +3233,15 @@ const term = {
     // 不进入 busy、不推 busyStart；已在 busy 则只续命（agent 干活时排队打字不打断）。
     // 续命只刷新 lastData（推迟评估时机），不刷新 lastReal（任务时长只数自发输出，打字不算工时）
     if (now - (s.lastInput || 0) < 400) { if (s.status === 'busy') s.lastData = now; return; }
+    let queueDirty = false;
+    if (s.needsInput || s.lastOutcome !== 'running') {
+      s.needsInput = false; s.waitClearedAt = 0; s.lastOutcome = 'running'; s.lastOutcomeAt = now; s.lastExcerpt = '';
+      queueDirty = true;
+    }
     s.lastData = now; s.lastReal = now;
-    if (s.status !== 'busy') { s.status = 'busy'; s.busyStart = now; this.renderTabs(); }
+    if (s.status !== 'busy') { s.status = 'busy'; s.busyStart = now; queueDirty = true; this.renderTabs(); }
     if (s.id !== this.active) { if (!s.unread) { s.unread = true; this.renderTabs(); } }
+    if (queueDirty) agentQueue.refresh();
     this.ensureStatusTick();
   },
   // 取缓冲区末尾 n 行纯文本：确认对话框和忙碌页脚都画在底部
@@ -3264,8 +3279,20 @@ const term = {
         // 阶段性收工不报喜：底部状态行还挂着后台任务（「1 shell, 1 monitor still running」/「· 1 shell ·」），
         // agent 跑完会被自动唤醒接着干——这会儿弹「完成」是误报。圆点照常变空闲，提醒全部按下，等真收工再响
         const foot = this.tailText(s, 8);
-        if (/\bstill running\b/i.test(foot) || /·\s*\d+\s+(shells?|monitors?|tasks?|agents?)\b/i.test(foot)) return;
+        if (/\bstill running\b/i.test(foot) || /·\s*\d+\s+(shells?|monitors?|tasks?|agents?)\b/i.test(foot)) {
+          s.needsInput = false; s.waitClearedAt = 0; s.lastOutcome = 'idle'; s.lastOutcomeAt = now; s.lastDuration = dur;
+          agentQueue.refresh();
+          return;
+        }
         const ask = dur > 600 && TERM_ASK_RE.test(tail); // 停在审批/确认界面：等你拍板（不设 4s 门槛，审批常来得很快）
+        s.needsInput = ask;
+        s.waitClearedAt = 0;
+        s.lastOutcome = ask ? 'waiting' : 'done';
+        s.lastOutcomeAt = now;
+        s.lastDuration = dur;
+        s.lastExcerpt = this.lastReplyExcerpt(s) || '';
+        this.renderTabs();
+        agentQueue.refresh();
         if (ask || dur > 1500) this.awaitGlow();
         if (ask) {
           playChime('ask'); // 非 done → 单音，和「完成」的双音区分开
@@ -3314,10 +3341,10 @@ const term = {
     bar.innerHTML = '';
     this.sessions.forEach((s) => {
       const t = document.createElement('div');
-      const dotState = s.dead ? 'dead' : (s.status === 'busy' ? 'busy' : 'idle');
+      const dotState = s.dead ? 'dead' : (s.needsInput ? 'waiting' : (s.status === 'busy' ? 'busy' : 'idle'));
       const followed = follow.on && follow.sid === s.id; // 文件跟随正盯着这个 tab
       t.className = 'term-tab' + (s.id === this.active ? ' active' : '') + (s.unread ? ' unread' : '') + (followed ? ' following' : '');
-      const dotTitle = s.dead ? '进程已退出' : (s.status === 'busy' ? 'agent 运行中' : '空闲');
+      const dotTitle = s.dead ? '进程已退出' : (s.needsInput ? '等待你确认' : (s.status === 'busy' ? 'agent 运行中' : '空闲'));
       // 终端图标按项目路径染色：同项目同色，和面包屑的配对色点呼应
       const hue = this.hueOf(s.cwd || s.startDir);
       t.title = followed ? '文件跟随正盯着这个终端 · 双击跳到它所在目录' : '双击：文件区跳到该终端所在目录';
@@ -3329,6 +3356,175 @@ const term = {
     });
   },
   retheme() { const th = this.theme(); this.sessions.forEach((s) => { s.xterm.options.theme = th; }); },
+};
+
+// ---------- Agent 任务总览 / 待接手队列 ----------
+const agentQueue = {
+  pop: null, _close: null, _resize: null,
+  fmtRun(ms) {
+    const s = Math.max(1, Math.round((ms || 0) / 1000));
+    if (s < 60) return s + '秒';
+    const m = Math.floor(s / 60), rest = s % 60;
+    if (m < 60) return rest ? `${m}分${rest}秒` : `${m}分`;
+    const h = Math.floor(m / 60), mm = m % 60;
+    return mm ? `${h}小时${mm}分` : `${h}小时`;
+  },
+  isWaiting(s) {
+    if (!s || s.dead || s.status === 'busy') return false;
+    if (s.needsInput) return true;
+    if (s.waitClearedAt && (s.lastData || 0) <= s.waitClearedAt) return false;
+    return TERM_ASK_RE.test(term.tailText(s, 22));
+  },
+  snapshot() {
+    const now = Date.now();
+    const sessions = term.sessions.map((s) => {
+      const waiting = this.isWaiting(s);
+      const running = s.status === 'busy';
+      const dead = !!(s.dead || s.status === 'dead');
+      const action = running ? latestAgentAction(s) : '';
+      const excerpt = (s.lastExcerpt || (!running ? term.lastReplyExcerpt(s, 110) : '') || '').trim();
+      const stamp = waiting ? (s.lastOutcomeAt || s.lastData || s.lastInput || now)
+        : (running ? (s.busyStart || s.lastData || now) : (s.lastOutcomeAt || s.lastData || s.lastInput || 0));
+      return {
+        id: s.id, title: s.title || baseOf(s.cwd || s.startDir || '') || 'shell',
+        path: tilde(s.cwd || s.startDir || ''), waiting, running, dead,
+        mode: waiting ? 'waiting' : (running ? 'running' : (dead ? 'dead' : 'done')),
+        action, excerpt, stamp,
+      };
+    });
+    const waiting = sessions.filter((s) => s.waiting).sort((a, b) => b.stamp - a.stamp);
+    const running = sessions.filter((s) => s.running && !s.waiting).sort((a, b) => b.stamp - a.stamp);
+    const recent = sessions.filter((s) => !s.running && !s.waiting && (s.dead || s.stamp))
+      .sort((a, b) => b.stamp - a.stamp).slice(0, 5);
+    return { sessions, waiting, running, recent, changes: state.changeLog.slice(0, 6), changeCount: state.changeLog.length };
+  },
+  refresh() {
+    this.renderBadge();
+    if (this.pop) this.render();
+  },
+  renderBadge() {
+    const btn = $('#btn-agent-queue');
+    const badge = $('#agent-queue-badge');
+    if (!btn || !badge) return;
+    const snap = this.snapshot();
+    const n = snap.waiting.length || snap.running.length;
+    badge.textContent = n ? String(n) : '';
+    badge.className = 'agentq-badge' + (n ? '' : ' hidden') + (snap.waiting.length ? ' urgent' : '');
+    btn.classList.toggle('active', !!this.pop);
+    btn.classList.toggle('attention', snap.waiting.length > 0);
+  },
+  toggle() { this.pop ? this.close() : this.open(); },
+  open() {
+    const existing = $('#agentq-pop');
+    if (existing) existing.remove();
+    const pop = document.createElement('div');
+    pop.id = 'agentq-pop';
+    pop.className = 'agentq-pop';
+    document.body.appendChild(pop);
+    this.pop = pop;
+    this.position();
+    this.render();
+    this._resize = () => this.position();
+    window.addEventListener('resize', this._resize);
+    setTimeout(() => {
+      if (this.pop !== pop) return;
+      this._close = (ev) => {
+        if (!ev.target.closest('#agentq-pop') && !ev.target.closest('#btn-agent-queue')) this.close();
+      };
+      document.addEventListener('click', this._close);
+    }, 0);
+    this.renderBadge();
+  },
+  close() {
+    if (this._close) document.removeEventListener('click', this._close);
+    if (this._resize) window.removeEventListener('resize', this._resize);
+    this._close = null; this._resize = null;
+    if (this.pop) this.pop.remove();
+    this.pop = null;
+    this.renderBadge();
+  },
+  position() {
+    if (!this.pop) return;
+    const btn = $('#btn-agent-queue');
+    if (!btn) return;
+    const r = btn.getBoundingClientRect();
+    this.pop.style.top = (r.bottom + 6) + 'px';
+    this.pop.style.right = Math.max(10, window.innerWidth - r.right) + 'px';
+  },
+  section(title, items, empty) {
+    const count = items.length ? `<span>${items.length}</span>` : '';
+    const rows = items.map((it) => this.row(it)).join('');
+    return `<div class="aq-section"><div class="aq-section-title"><span>${title}</span>${count}</div>${rows || `<div class="aq-empty">${empty}</div>`}</div>`;
+  },
+  row(it) {
+    const pill = it.waiting ? '待接手' : (it.running ? '运行中' : (it.dead ? '已退出' : '已收工'));
+    const time = it.running ? this.fmtRun(Date.now() - it.stamp) : (it.stamp ? fmtTime(it.stamp) : '');
+    const note = it.waiting ? (it.excerpt || '停在确认界面')
+      : (it.running ? (it.action || '终端有输出，正在推进') : (it.excerpt || (it.dead ? '进程已退出' : '暂无摘要')));
+    return `<button class="aq-row ${it.mode}" data-session="${escapeHtml(it.id)}" type="button">
+      <span class="aq-dot"></span>
+      <span class="aq-main">
+        <span class="aq-top"><span class="aq-name">${escapeHtml(it.title)}</span><span class="aq-pill">${pill}</span></span>
+        <span class="aq-path">${escapeHtml(it.path || '未知目录')}</span>
+        <span class="aq-note">${escapeHtml(note)}</span>
+      </span>
+      <span class="aq-time">${escapeHtml(time)}</span>
+    </button>`;
+  },
+  files(changes) {
+    if (!changes.length) return '<div class="aq-empty">还没有捕捉到 agent 写入的文件。</div>';
+    return `<div class="aq-files">${changes.map((c) => `<div class="aq-file" data-path="${escapeHtml(c.path)}"><span>${escapeHtml(c.name)}${c.count > 1 ? ` ×${c.count}` : ''}</span><span>${fmtClock(c.ts)}</span></div>`).join('')}</div>`;
+  },
+  render() {
+    if (!this.pop) return;
+    const snap = this.snapshot();
+    const sub = term.available()
+      ? (snap.sessions.length ? '从内嵌终端和本会话变更实时汇总' : '打开终端后会自动汇总 agent 状态')
+      : '桌面版内嵌终端可显示 agent 状态';
+    const emptyCopy = term.available()
+      ? '先用顶栏“终端”启动 Claude 或 Codex；任务、确认点和改过的文件会排到这里。'
+      : '当前是浏览器版；桌面 App 里的内嵌终端会把 agent 状态排到这里。';
+    const changeSection = `<div class="aq-section"><div class="aq-section-title"><span>最近产物</span><span>${snap.changeCount}</span></div>${this.files(snap.changes)}</div>`;
+    const body = snap.sessions.length
+      ? this.section('待接手', snap.waiting, '没有等待你确认的 agent。')
+        + this.section('运行中', snap.running, '当前没有运行中的 agent。')
+        + this.section('最近收工', snap.recent, '还没有本次会话的收工记录。')
+        + changeSection
+      : `<div class="aq-empty">${emptyCopy}</div>${snap.changeCount ? changeSection : ''}`;
+    this.pop.innerHTML = `<div class="aq-head">
+      <div><div class="aq-title">Agent 任务总览</div><div class="aq-sub">${sub}</div></div>
+      <div class="aq-actions"><button class="ghost-btn" data-act="changes">变更</button><button class="ghost-btn" data-act="replay">录像</button></div>
+    </div>
+    <div class="aq-body">
+      <div class="aq-stats">
+        <div class="aq-stat waiting"><span class="aq-num">${snap.waiting.length}</span><span class="aq-label">待接手</span></div>
+        <div class="aq-stat"><span class="aq-num">${snap.running.length}</span><span class="aq-label">运行中</span></div>
+        <div class="aq-stat"><span class="aq-num">${snap.changeCount}</span><span class="aq-label">最近产物</span></div>
+      </div>
+      ${body}
+    </div>
+    <div class="aq-footer">点一行会直接切到对应终端；输入后会从待接手队列移除。</div>`;
+    this.pop.querySelectorAll('[data-session]').forEach((row) => {
+      row.onclick = () => this.openSession(row.dataset.session);
+    });
+    this.pop.querySelectorAll('.aq-file[data-path]').forEach((row) => {
+      row.onclick = async () => {
+        const p = row.dataset.path;
+        this.close();
+        await navigate(dirOf(p));
+        const e = state.entries.find((x) => x.path === p) || { path: p, name: baseOf(p), kind: kindFromName(p), isDir: false };
+        applySelection(p); openPreview(e); recordRecent(p);
+      };
+    });
+    this.pop.querySelector('[data-act="changes"]').onclick = () => { this.close(); const old = $('#changes-pop'); if (old) old.remove(); toggleChangesPanel(); };
+    this.pop.querySelector('[data-act="replay"]').onclick = () => { this.close(); player.open(); };
+  },
+  openSession(id) {
+    if (!term.sessions.some((s) => s.id === id)) { this.refresh(); return; }
+    this.close();
+    term.open();
+    term.activate(id);
+  },
 };
 
 // ---------- Agent 用量面板（侧栏常驻，可开合）----------
@@ -3733,6 +3929,7 @@ function recordChange(dir, filename) {
   state.changeLog.sort((a, b) => b.ts - a.ts);
   if (state.changeLog.length > 100) state.changeLog.length = 100;
   renderChangesBadge();
+  agentQueue.refresh();
 }
 function renderChangesBadge() {
   const b = $('#changes-badge'); if (!b) return;
@@ -3762,7 +3959,7 @@ function toggleChangesPanel() {
   const btn = $('#btn-changes'); const r = btn.getBoundingClientRect();
   pop.style.top = (r.bottom + 6) + 'px';
   pop.style.right = (window.innerWidth - r.right) + 'px';
-  const clear = $('#cp-clear'); if (clear) clear.onclick = (ev) => { ev.stopPropagation(); state.changeLog = []; state.changeTimeline = []; renderChangesBadge(); pop.remove(); };
+  const clear = $('#cp-clear'); if (clear) clear.onclick = (ev) => { ev.stopPropagation(); state.changeLog = []; state.changeTimeline = []; renderChangesBadge(); agentQueue.refresh(); pop.remove(); };
   const rep = $('#cp-replay'); if (rep) rep.onclick = (ev) => { ev.stopPropagation(); pop.remove(); openReplay(); };
   pop.querySelectorAll('.cp-row').forEach((row) => {
     row.onclick = async () => {
@@ -4244,9 +4441,10 @@ if (window.fanboxPty) {
   window.fanboxPty.onExit(({ id }) => {
     const s = term.sessions.find((x) => x.id === id);
     if (s) {
-      s.dead = true; s.status = 'dead';
+      s.dead = true; s.status = 'dead'; s.needsInput = false; s.waitClearedAt = 0; s.lastOutcome = 'dead'; s.lastOutcomeAt = Date.now(); s.lastExcerpt = '进程已退出';
       s.xterm.write('\r\n\x1b[90m[进程已退出 — 回车重开，或 ✕ 关闭]\x1b[0m\r\n');
       term.renderTabs();
+      agentQueue.refresh();
       term.notify(s, '终端已退出', (s.title || 'shell') + ' 的进程结束了');
     }
   });

@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('fanboxFs', {
 });
 
 contextBridge.exposeInMainWorld('fanboxClipboard', {
+  readText: () => ipcRenderer.invoke('clip:read-text'),
+  writeText: (text) => ipcRenderer.invoke('clip:write-text', { text }),
   copyImage: (path) => ipcRenderer.invoke('clip:image', { path }),
   copyFile: (path) => ipcRenderer.invoke('clip:file', { path }),
 });

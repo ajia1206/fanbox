@@ -2886,6 +2886,43 @@ const term = {
     };
     if (wasHidden) setTimeout(write, 300); else write();
   },
+  pasteText(id, text) {
+    const s = this.sessions.find((x) => x.id === id);
+    if (!s || s.dead || !text) return false;
+    this.input(id, '\x1b[200~' + String(text).replace(/\r\n/g, '\n') + '\x1b[201~');
+    s.xterm.focus();
+    return true;
+  },
+  async pasteActive() {
+    const s = this.sessions.find((x) => x.id === this.active);
+    if (!s || s.dead) return false;
+    let text = '';
+    try {
+      if (window.fanboxClipboard?.readText) {
+        const r = await window.fanboxClipboard.readText();
+        if (r && r.ok) text = r.text || '';
+      }
+      if (!text && navigator.clipboard?.readText) text = await navigator.clipboard.readText();
+    } catch { /* 系统拒绝读剪贴板时静默退回，不打断终端 */ }
+    return this.pasteText(s.id, text);
+  },
+  async copySelectionActive() {
+    const s = this.sessions.find((x) => x.id === this.active);
+    const text = s && !s.dead && s.xterm.getSelection ? s.xterm.getSelection() : '';
+    if (!text) return false;
+    try {
+      if (window.fanboxClipboard?.writeText) {
+        const r = await window.fanboxClipboard.writeText(text);
+        if (!r || !r.ok) throw new Error((r && r.error) || 'copy failed');
+      } else if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else return false;
+      toast('已复制终端选区');
+      return true;
+    } catch (err) {
+      toast('复制终端选区失败：' + (err && err.message ? err.message : ''), true);
+      return false;
+    }
+  },
   // 用户输入统一入口：记 lastInput 供回显过滤（击键/粘贴/拖路径/跟随 cd 引发的重绘不算 agent 干活）
   input(id, d) {
     const s = this.sessions.find((x) => x.id === id);
@@ -3013,6 +3050,27 @@ const term = {
       try { const U = window.Unicode11Addon.Unicode11Addon || window.Unicode11Addon; xterm.loadAddon(new U()); xterm.unicode.activeVersion = '11'; } catch { /* */ }
     }
     xterm.open(host);
+    const isMac = (window.fanboxEnv?.platform || navigator.platform || '').toLowerCase().includes('mac');
+    if (xterm.attachCustomKeyEventHandler) xterm.attachCustomKeyEventHandler((ev) => {
+      const key = String(ev.key || '').toLowerCase();
+      const pasteCombo = key === 'v' && (isMac ? ev.metaKey : (ev.ctrlKey && ev.shiftKey));
+      const copyCombo = key === 'c' && (isMac ? ev.metaKey : (ev.ctrlKey && ev.shiftKey));
+      if (pasteCombo) { ev.preventDefault(); this.pasteActive(); return false; }
+      if (copyCombo && xterm.getSelection()) { ev.preventDefault(); this.copySelectionActive(); return false; }
+      return true;
+    });
+    host.addEventListener('paste', (ev) => {
+      const text = ev.clipboardData && ev.clipboardData.getData('text/plain');
+      if (!text) return;
+      ev.preventDefault();
+      this.pasteText(id, text);
+    });
+    host.addEventListener('copy', (ev) => {
+      const text = xterm.getSelection ? xterm.getSelection() : '';
+      if (!text || !ev.clipboardData) return;
+      ev.clipboardData.setData('text/plain', text);
+      ev.preventDefault();
+    });
     // 滚动失同步自愈：DOM 滚动条已到底但 buffer 没到底，是 5.5.0 旧 Viewport 的 bug 签名
     //（正常跟随输出时两者同步在底、用户上翻时 DOM 不在底，都不会触发），重算滚动区并到底
     const vpEl = host.querySelector('.xterm-viewport');
@@ -4085,13 +4143,18 @@ function isFollowArtifact(name) {
 function setFileFollow(on, offMsg) {
   if (follow.on === on) return;
   // 开启：把跟随死死锚定到一个活着的终端 tab——只盯这个 agent，别的 tab 一律不串。
-  // 桌面有终端却没有活动 tab 时直接拒绝（否则退化成「全文件系统跟随」，正是要根治的乱源）。
+  // 桌面有终端时先显式打开并切回被绑定 tab，避免点了「文件跟随」却没有跳到终端上下文。
   if (on && typeof term !== 'undefined' && term.available()) {
-    const sid = term.sessions.some((x) => x.id === term.active) ? term.active : null;
+    if ($('#terminal-panel')?.classList.contains('hidden') || !term.sessions.length) term.open();
+    const sid = term.sessions.some((x) => x.id === term.active) ? term.active : (term.sessions[0] && term.sessions[0].id);
     if (!sid) { toast('先点开一个终端 tab，跟随才知道盯哪个 agent', true); $('#file-follow')?.classList.remove('on'); return; }
     follow.sid = sid;
     const s = term.sessions.find((x) => x.id === sid);
-    if (s) term.refreshCwd(s, true).catch(() => {}); // 立刻校准 cwd，scope 从第一笔就准（不靠回车后的延迟轮询）
+    if (s) {
+      term.activate(s.id);
+      setTimeout(() => s.xterm.focus(), 0);
+      term.refreshCwd(s, true).catch(() => {}); // 立刻校准 cwd，scope 从第一笔就准（不靠回车后的延迟轮询）
+    }
     follow.label = s ? (baseOf(s.cwd || s.startDir || '') || s.title || '') : '';
   } else {
     follow.sid = null; follow.label = ''; // 浏览器版无终端：维持旧口径（全跟）
@@ -4105,7 +4168,7 @@ function setFileFollow(on, offMsg) {
   follow.swapping = false; follow.swapDirty = false;
   if (typeof term !== 'undefined') term.renderTabs(); // 给绑定的 tab 标上/撤掉「跟随中」标记
   if (!on) $('#preview-title')?.querySelector('.live-badge')?.remove(); // 留住最后画面，只摘掉「跟随中」
-  toast(on ? (follow.label ? `文件跟随已开 · 盯着「${follow.label}」这个终端` : '文件跟随已开：agent 改哪个文件就看哪个') : (offMsg || '文件跟随已停'));
+  toast(on ? (follow.label ? `文件跟随已开 · 已切到「${follow.label}」终端` : '文件跟随已开：agent 改哪个文件就看哪个') : (offMsg || '文件跟随已停'));
   // 一开就有得看：5 分钟内有过范围内的变更就直接跟上，不用干等 agent 下一笔
   if (on) {
     startFollowNarration(); // 底部过程旁白：实时说 agent 在干嘛

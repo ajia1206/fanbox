@@ -482,7 +482,15 @@ ipcMain.handle('pty:spawn', (e, { id, cwd, cols, rows, theme }) => {
   });
   return { ok: true, cwd: startCwd };
 });
-// ---------- 剪贴板：复制图片本体 / 复制文件（访达可粘贴）----------
+// ---------- 剪贴板：复制图片本体 / 复制文件（访达可粘贴）/ 终端文本 ----------
+ipcMain.handle('clip:read-text', () => {
+  try { return { ok: true, text: clipboard.readText() || '' }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
+ipcMain.handle('clip:write-text', (e, { text }) => {
+  try { clipboard.writeText(String(text ?? '')); return { ok: true }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
 ipcMain.handle('clip:image', (e, { path: p }) => {
   try { const img = nativeImage.createFromPath(p); if (img.isEmpty()) return { ok: false, error: '不是可读图片' }; clipboard.writeImage(img); return { ok: true }; }
   catch (err) { return { ok: false, error: err.message }; }

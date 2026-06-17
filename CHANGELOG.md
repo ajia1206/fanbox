@@ -16,6 +16,9 @@
 
 ### Fixed
 - **打包版终端启动失败**：`node-pty` 的 macOS `spawn-helper` 在安装后缺少执行位会导致 `posix_spawnp failed`。现在安装依赖和打包前都会自动补齐权限，避免 DMG 带出不可启动的内嵌终端。
+- **文件跟随没有跳到终端**：开启文件跟随时会自动打开并切回被绑定的终端 tab，让“盯着哪个 agent”有明确上下文。
+- **内嵌终端复制粘贴不稳定**：新增文本剪贴板桥接，终端支持 `⌘V` bracketed paste、`⌘C` 复制选区，并保留菜单/系统 paste 事件兜底。
+- **打包终端回归无自动校验**：新增 `npm run verify:dist-terminal` 和 `npm run dist:verify`，可对已生成的 `.app` 执行 node-pty 启动 smoke test。
 
 ## [1.13.0] - 2026-06-17
 

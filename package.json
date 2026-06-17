@@ -14,9 +14,11 @@
     "build:hljs": "esbuild src-vendor/hljs-entry.js --bundle --format=iife --minify --outfile=public/vendor/hljs/highlight.js && cp node_modules/marked/marked.min.js public/vendor/marked/marked.min.js && cp node_modules/highlight.js/styles/github-dark.min.css node_modules/highlight.js/styles/github.min.css public/vendor/hljs/styles/",
     "check:vendor-patch": "grep -q '20===e.keyCode||229===e.keyCode' public/vendor/xterm/xterm.js",
     "fix:node-pty-perms": "node scripts/ensure-node-pty-perms.js",
+    "verify:dist-terminal": "node scripts/verify-dist-terminal.js",
     "postinstall": "npm run fix:node-pty-perms",
     "predist": "npm run check:vendor-patch && npm run fix:node-pty-perms",
-    "dist": "electron-builder --mac"
+    "dist": "electron-builder --mac",
+    "dist:verify": "npm run dist && npm run verify:dist-terminal"
   },
   "build": {
     "appId": "com.huashu.fanbox",

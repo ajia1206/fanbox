@@ -174,7 +174,7 @@ npm run app          # electron . 启动完整桌面版 / full desktop app
 npm run dist         # 打包签名 .dmg（产物在 dist/，不入 git）/ build & sign the .dmg (output in dist/)
 ```
 
-> 打包遇到 Electron 下载被墙：`ELECTRON_MIRROR="https://registry.npmmirror.com/-/binary/electron/" npm run dist`
+> 打包遇到 Electron 下载被墙：`ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/" npm run dist`
 
 ## Shortcuts · 快捷键
 

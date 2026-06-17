@@ -302,10 +302,12 @@ const bridge = {
     };
     ilink.sendTyping(this.account, from, true);
     const typingTimer = setInterval(() => { if (alive) ilink.sendTyping(this.account, from, true); }, 4000);
-    const reassureTimer = setInterval(() => { if (alive && Date.now() - lastBeat > 22000) beat(pickReassure()); }, 4000);
+    // 安抚消息已停用（花叔决定）：「对方正在输入」气泡已足够表达链路活着，安抚文字是噪音。
+    // 备查：如需恢复，放开下一行（曾每 22s 刷一次太密集，改成 2 分钟才发一次），并在 stop() 里 clearTimeout(reassureTimer)。
+    // const reassureTimer = setTimeout(() => { if (alive) beat(pickReassure()); }, 120000);
     return {
       onProgress: (note) => { if (alive && note && Date.now() - lastBeat > 15000) beat('⏳ ' + note); },
-      stop: () => { alive = false; clearInterval(typingTimer); clearInterval(reassureTimer); ilink.sendTyping(this.account, from, false); },
+      stop: () => { alive = false; clearInterval(typingTimer); ilink.sendTyping(this.account, from, false); },
     };
   },
 

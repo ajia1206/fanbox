@@ -508,13 +508,40 @@ async function codexOrganizeFlags(bin) {
   return flags;
 }
 
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function agentSearchPath() {
+  const dirs = [
+    ...(process.env.PATH || '').split(path.delimiter),
+    path.join(HOME, '.local/bin'),
+    path.join(HOME, '.npm-global/bin'),
+    path.join(HOME, '.bun/bin'),
+    path.join(HOME, '.cargo/bin'),
+    '/opt/homebrew/bin',
+    '/opt/homebrew/opt/node@22/bin',
+    '/usr/local/bin',
+  ];
+  const nvmRoot = path.join(HOME, '.nvm', 'versions', 'node');
+  try {
+    for (const v of fs.readdirSync(nvmRoot).sort().reverse()) dirs.push(path.join(nvmRoot, v, 'bin'));
+  } catch { /* nvm 未安装或无权限，跳过 */ }
+  return [...new Set(dirs.filter(Boolean))].join(path.delimiter);
+}
+
 async function findAgentBin(name) {
-  // GUI 启动的 app 没有用户 shell 的 PATH，走登录 shell 找一次绝对路径
+  // GUI 启动的 app 没有用户终端里的 PATH：先补常见目录，再让登录/交互式 shell 兜底。
+  if (!/^[\w.-]+$/.test(name)) return null;
+  const env = { ...process.env, PATH: agentSearchPath() };
   return new Promise((resolve) => {
-    execFile('/bin/zsh', ['-lc', `command -v ${name}`], { timeout: 8000 }, (err, stdout) => {
-      const out = String(stdout || '').trim().split('\n').pop();
-      resolve(!err && out && out.startsWith('/') ? out : null);
+    const tryShell = (flag) => execFile('/bin/zsh', [flag, `command -v ${name}`], { timeout: 8000, env }, (err, stdout) => {
+      const out = String(stdout || '').trim().split('\n').reverse().find((x) => x.startsWith('/'));
+      if (!err && out) resolve(out);
+      else if (flag === '-lc') tryShell('-lic');
+      else resolve(null);
     });
+    tryShell('-lc');
   });
 }
 
@@ -580,8 +607,8 @@ ${history || '（还没有历史记录）'}
   const kickoff = `先完整读 ${ORGANIZE_BRIEF_FILE}，然后按里面的约定，和我对话式整理当前文件夹`;
   // claude 跳权限确认（动手前方案已过人）；codex 旗标按当前版本实测拼出
   const cmd = engine === 'codex'
-    ? `codex${await codexOrganizeFlags(bin)} "${kickoff}"`
-    : `claude --dangerously-skip-permissions "${kickoff}"`;
+    ? `${shellQuote(bin)}${await codexOrganizeFlags(bin)} ${shellQuote(kickoff)}`
+    : `${shellQuote(bin)} --dangerously-skip-permissions ${shellQuote(kickoff)}`;
   return { ok: true, engine, cmd };
 }
 
